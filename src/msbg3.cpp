@@ -2584,12 +2584,13 @@ void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
   {
     auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
     auto *sgD = getPSFloatChannel(CH_DIAGONAL, level, levelMg);
-    auto *sgU = getFaceAreaChannel(0, level, levelMg);
-    auto *sgV = getFaceAreaChannel(1, level, levelMg);
-    auto *sgW = getFaceAreaChannel(2, level, levelMg);
     if(!sgF || !sgD) continue;
 
     sgD->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+
+    // Uniform weight stencil: D = 1/6
+    // processBlockLaplacian internally handles grid spacing (h) scaling
+    const PSFloat diagVal = (PSFloat)(1.f / 6.f);
 
     for(int bid = 0; bid < _nBlocks; bid++)
     {
@@ -2599,13 +2600,7 @@ void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
 
       CellFlags *f = sgF->getBlockDataPtr(bid);
       PSFloat   *d = sgD->getBlockDataPtr(bid, 1, 0);
-      float *u = sgU ? sgU->getBlockDataPtr(bid) : nullptr;
-      float *v = sgV ? sgV->getBlockDataPtr(bid) : nullptr;
-      float *w = sgW ? sgW->getBlockDataPtr(bid) : nullptr;
       if(!f || !d) continue;
-
-      const int bsx = sgF->bsx();
-      const int yStride = bsx, zStride = bsx*bsx;
 
       for(int i = 0; i < sgF->nVoxelsInBlock(); i++)
       {
@@ -2614,8 +2609,7 @@ void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
           d[i] = 0;
           continue;
         }
-        // Uniform weight stencil (BLK_CUTS_SOLID not set)
-        d[i] = (PSFloat)(1.f / 6.f);
+        d[i] = diagVal;
       }
     }
   }
