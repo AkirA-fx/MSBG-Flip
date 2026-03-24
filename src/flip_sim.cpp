@@ -1424,23 +1424,63 @@ static void pressureProjection( MSBG::MultiresSparseGrid *msbg,
 }
 
 //=== 5. G2P =================================================================
-// MSBG level-aware MAC補間: 粒子位置からblockのlevelを考慮
-// (Step 2: 現在は全block level=0で自前trilinearと同一結果)
+// MSBG level-aware MAC補間: 粒子位置からblockのlevelを考慮して
+// 適切なresolution levelのSparseGridからtrilinear補間する
 static float interpCompMSBG( MSBG::MultiresSparseGrid *msbg,
                               SBG::SparseGrid<Vec3Float> *sg,
                               float px,float py,float pz,
-                              float ox,float oy,float oz,int comp )
+                              float ox,float oy,float oz,int comp,
+                              int chanId = MSBG::CH_VEC3_4 )
 {
-    // TODO: adaptive時はmsbg->getBlockInfo(bid)->levelに応じて
-    //       適切なlevelのSparseGridから読む。現在はlevel=0固定。
-    (void)msbg;
+    // MAC stagger offset を適用した grid 座標
     const float gx=px-ox,gy=py-oy,gz=pz-oz;
     const int ix0=(int)floorf(gx),iy0=(int)floorf(gy),iz0=(int)floorf(gz);
     const float fx=gx-ix0,fy=gy-iy0,fz=gz-iz0;
+
+    // 中心voxelのblock levelを取得
+    const int nx=sg->sx(), ny=sg->sy(), nz=sg->sz();
+    const int cx=std::max(0,std::min(ix0,nx-1));
+    const int cy=std::max(0,std::min(iy0,ny-1));
+    const int cz=std::max(0,std::min(iz0,nz-1));
+    int bx,by,bz;
+    sg->getBlockCoords(cx,cy,cz,bx,by,bz);
+    const int bid=sg->getBlockIndex(bx,by,bz);
+    const int level=msbg->getBlockLevel(bid);
+
+    if(level==0)
+    {
+        // Fast path: level 0 — use original SG directly
+        float sum=0.f;
+        for(int dz=0;dz<=1;dz++) for(int dy=0;dy<=1;dy++) for(int dx=0;dx<=1;dx++)
+            sum+=(dx?fx:1.f-fx)*(dy?fy:1.f-fy)*(dz?fz:1.f-fz)
+                 *getVC(sg,ix0+dx,iy0+dy,iz0+dz,comp);
+        return sum;
+    }
+
+    // Coarse level: read from level-specific SparseGrid
+    // Coordinates are scaled down by (1<<level)
+    const int shift=level;
+    auto *sgLev=msbg->getVecChannel(chanId,level,0);
+    if(!sgLev) sgLev=sg; // fallback
+
+    // Coarse grid coordinates
+    const float cgx=gx/(1<<shift), cgy=gy/(1<<shift), cgz=gz/(1<<shift);
+    const int cix0=(int)floorf(cgx), ciy0=(int)floorf(cgy), ciz0=(int)floorf(cgz);
+    const float cfx=cgx-cix0, cfy=cgy-ciy0, cfz=cgz-ciz0;
+
     float sum=0.f;
     for(int dz=0;dz<=1;dz++) for(int dy=0;dy<=1;dy++) for(int dx=0;dx<=1;dx++)
-        sum+=(dx?fx:1.f-fx)*(dy?fy:1.f-fy)*(dz?fz:1.f-fz)
-             *getVC(sg,ix0+dx,iy0+dy,iz0+dz,comp);
+    {
+        int ix2=cix0+dx, iy2=ciy0+dy, iz2=ciz0+dz;
+        int b2,v2;
+        float val=0.f;
+        if(getBidVidV(sgLev,ix2,iy2,iz2,b2,v2))
+        {
+            Vec3Float *d=sgLev->getBlockDataPtr(b2);
+            if(d) val=(comp==0?d[v2].x:(comp==1?d[v2].y:d[v2].z));
+        }
+        sum+=(dx?cfx:1.f-cfx)*(dy?cfy:1.f-cfy)*(dz?cfz:1.f-cfz)*val;
+    }
     return sum;
 }
 
@@ -1455,12 +1495,12 @@ static void gridToParticle( MSBG::MultiresSparseGrid *msbg,
         for(size_t i=range.begin();i<range.end();i++)
         {
             FlipParticle &p=gParticles[i];
-            float picU=interpCompMSBG(msbg,sgVel,   p.pos.x,p.pos.y,p.pos.z,0.f,0.5f,0.5f,0);
-            float picV=interpCompMSBG(msbg,sgVel,   p.pos.x,p.pos.y,p.pos.z,0.5f,0.f,0.5f,1);
-            float picW=interpCompMSBG(msbg,sgVel,   p.pos.x,p.pos.y,p.pos.z,0.5f,0.5f,0.f,2);
-            float oldU=interpCompMSBG(msbg,sgVelOld,p.pos.x,p.pos.y,p.pos.z,0.f,0.5f,0.5f,0);
-            float oldV=interpCompMSBG(msbg,sgVelOld,p.pos.x,p.pos.y,p.pos.z,0.5f,0.f,0.5f,1);
-            float oldW=interpCompMSBG(msbg,sgVelOld,p.pos.x,p.pos.y,p.pos.z,0.5f,0.5f,0.f,2);
+            float picU=interpCompMSBG(msbg,sgVel,   p.pos.x,p.pos.y,p.pos.z,0.f,0.5f,0.5f,0,MSBG::CH_VEC3_4);
+            float picV=interpCompMSBG(msbg,sgVel,   p.pos.x,p.pos.y,p.pos.z,0.5f,0.f,0.5f,1,MSBG::CH_VEC3_4);
+            float picW=interpCompMSBG(msbg,sgVel,   p.pos.x,p.pos.y,p.pos.z,0.5f,0.5f,0.f,2,MSBG::CH_VEC3_4);
+            float oldU=interpCompMSBG(msbg,sgVelOld,p.pos.x,p.pos.y,p.pos.z,0.f,0.5f,0.5f,0,MSBG::CH_VEC3_2);
+            float oldV=interpCompMSBG(msbg,sgVelOld,p.pos.x,p.pos.y,p.pos.z,0.5f,0.f,0.5f,1,MSBG::CH_VEC3_2);
+            float oldW=interpCompMSBG(msbg,sgVelOld,p.pos.x,p.pos.y,p.pos.z,0.5f,0.5f,0.f,2,MSBG::CH_VEC3_2);
             p.vel.x=(1.f-alpha)*picU+alpha*(p.vel.x+(picU-oldU));
             p.vel.y=(1.f-alpha)*picV+alpha*(p.vel.y+(picV-oldV));
             p.vel.z=(1.f-alpha)*picW+alpha*(p.vel.z+(picW-oldW));
