@@ -47,7 +47,7 @@ static const float BETA_MIN    = 1e-6f;  // β下限ガード（ゼロ除算/数
 
 // Step 4/6: ソルバー選択
 enum class PressureSolverKind { MIC0_PCG, HYPRE_AMG_PCG, MSBG_VCYCLE_PCG };
-static PressureSolverKind gSolverKind = PressureSolverKind::HYPRE_AMG_PCG;
+static PressureSolverKind gSolverKind = PressureSolverKind::MSBG_VCYCLE_PCG;
 
 struct FlipParticle { Vec3Float pos, vel; int phase; /* 0=liquid 1=air */ };
 static std::vector<FlipParticle> gParticles;
@@ -206,7 +206,10 @@ static void buildRefinementMapFromParticles(
     const int nBlk=msbg->nBlocks();
     const int nLevels=msbg->getNumLevels();
     const int coarsest=nLevels-1;
-    blockLevels.assign(nBlk,coarsest);
+    // TODO: 適応グリッドはFC/CF halo問題修正後に有効化
+    // 現在は全blockをlevel 0（単一解像度）で動作させる
+    blockLevels.assign(nBlk, 0);
+    return;
 
     // BFS: 液体ブロックからのblock距離を計算
     const int INF=0x7fffffff;

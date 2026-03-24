@@ -1321,7 +1321,7 @@ void MultiresSparseGrid::IprocessBlockLaplacian(
 	  else
 	  {
 	    B.load_a(dataB+vid);
-	    Y = omega*(B+S)*D  + oneMinusOmega * F0;
+	    Y = select( D!=0.0f, omega*(B+S)*D + oneMinusOmega * F0, F0 );
 
 	    #ifdef ADAPTIVE_BLOCK_LOCAL_RELAX
 	    //UT_ASSERT0( !vany(D==0.0f) );
@@ -2367,6 +2367,36 @@ void MultiresSparseGrid::relax(   int boundaryZoneOnly,
 }
 
 /*-------------------------------------------------------------------------*/
+// Zero all existing blocks of a float channel without creating const blocks.
+// Unlike setChannel(0.0,...) this avoids const-block substitution that causes
+// alloc-on-write thrashing in the monotonic block pool.
+static void zeroChannelInPlace(MultiresSparseGrid *msg, int ch, int levelMg)
+{
+  for(int level = 0; level < msg->getNumLevels(); level++)
+  {
+    auto *sg = msg->getFloatChannel(ch, level, levelMg);
+    if(!sg) continue;
+    for(LongInt bid = 0; bid < sg->nBlocks(); bid++)
+    {
+      MSBG::BlockInfo *bi = msg->getBlockInfo((int)bid, levelMg);
+      if(!bi || bi->level != level) continue;
+
+      // Try read-only first to reuse existing block
+      float *d = sg->getBlockDataPtr((int)bid);
+      if(d)
+      {
+        memset(d, 0, sg->nVoxelsInBlock() * sizeof(float));
+      }
+      else
+      {
+        // First time: allocate + zero
+        sg->getBlockDataPtr((int)bid, 1, 1);
+      }
+    }
+  }
+}
+
+/*-------------------------------------------------------------------------*/
 /* V-cycle multigrid solver / preconditioner                               */
 /* chX = solution (in/out), chB = rhs (read-only at this level)            */
 /* chResidual, chTmp = work channels                                       */
@@ -2390,17 +2420,73 @@ void MultiresSparseGrid::vCycle(
   // Dense level はチャンネル管理が異なるため、sparse levelのみ使用
   const int coarsest = getNumLevels() - 1;
 
+  fprintf(stderr, "FDBG vCycle: levelMg=%d coarsest=%d\n", levelMg, coarsest); fflush(stderr);
+
   // Base case: coarsest level — direct solve via relaxation
   if(levelMg >= coarsest)
   {
+    fprintf(stderr, "FDBG vCycle: coarsest relax levelMg=%d\n", levelMg); fflush(stderr);
     relax( 0, 0, levelMg, chX, chB, chTmp, nCoarse, 0 );
+    fprintf(stderr, "FDBG vCycle: coarsest relax done\n"); fflush(stderr);
     return;
   }
 
   // 1. Pre-smoothing
+  if(levelMg == 0)
+  {
+    // Check chX, chB, diagonal for nan before relax
+    int xNan=0, bNan=0, dNan=0, bInf=0;
+    long double bSum=0;
+    for(int level=0; level<_nLevels; level++) {
+      auto *sgChk = getFloatChannel(chX, level, levelMg);
+      if(sgChk) for(int b=0;b<sgChk->nBlocks();b++) {
+        float *dd=sgChk->getBlockDataPtr(b); if(!dd) continue;
+        for(int i=0;i<sgChk->nVoxelsInBlock();i++)
+          if(std::isnan(dd[i])||std::isinf(dd[i])) xNan++;
+      }
+      auto *sgB = getFloatChannel(chB, level, levelMg);
+      if(sgB) for(int b=0;b<sgB->nBlocks();b++) {
+        float *dd=sgB->getBlockDataPtr(b); if(!dd) continue;
+        for(int i=0;i<sgB->nVoxelsInBlock();i++) {
+          if(std::isnan(dd[i])) bNan++;
+          else if(std::isinf(dd[i])) bInf++;
+          else bSum += dd[i];
+        }
+      }
+      auto *sgD = getPSFloatChannel(CH_DIAGONAL, level, levelMg);
+      if(sgD) for(int b=0;b<sgD->nBlocks();b++) {
+        float *dd=sgD->getBlockDataPtr(b); if(!dd) continue;
+        for(int i=0;i<sgD->nVoxelsInBlock();i++)
+          if(std::isnan(dd[i])||std::isinf(dd[i])) dNan++;
+      }
+    }
+    // Check bi->level distribution
+    int lvCnt[4]={0,0,0,0};
+    for(int b=0;b<_nBlocks;b++) {
+      BlockInfo *bi=getBlockInfo(b,levelMg);
+      if(bi && bi->level>=0 && bi->level<4) lvCnt[bi->level]++;
+    }
+    fprintf(stderr, "FDBG vCycle: pre-relax xNan=%d bNan=%d bInf=%d bSum=%g dNan=%d blocksRelax=%d levels=%d/%d/%d/%d\n",
+            xNan, bNan, bInf, (double)bSum, dNan, (int)_blocksRelax[levelMg].size(),
+            lvCnt[0],lvCnt[1],lvCnt[2],lvCnt[3]); fflush(stderr);
+  }
   relax( 0, 0, levelMg, chX, chB, chTmp, nPre, 0 );
+  if(levelMg == 0)
+  {
+    long double xSum = 0; int xNan = 0;
+    auto *sgChk = getFloatChannel(chX, 0, levelMg);
+    if(sgChk) for(int bid = 0; bid < sgChk->nBlocks(); bid++) {
+      float *dd = sgChk->getBlockDataPtr(bid); if(!dd) continue;
+      for(int ii = 0; ii < sgChk->nVoxelsInBlock(); ii++) {
+        if(std::isnan(dd[ii])||std::isinf(dd[ii])) xNan++;
+        else xSum += dd[ii];
+      }
+    }
+    fprintf(stderr, "FDBG vCycle: post-relax chX sum=%g nan=%d\n", (double)xSum, xNan); fflush(stderr);
+  }
 
   // 2. Compute residual: chResidual = chB - A * chX
+  fprintf(stderr, "FDBG vCycle: residual levelMg=%d\n", levelMg); fflush(stderr);
   multiplyLaplacianMatrixOpt(
       OPT_CALC_RESIDUAL,
       levelMg,
@@ -2414,12 +2500,12 @@ void MultiresSparseGrid::vCycle(
 
   // 3. Restrict residual to coarse level: coarse_rhs = R * residual
   //    Use chB at coarse level as the coarse RHS
-  setChannel( 0.0, chB, -1, levelMg + 1 );
+  zeroChannelInPlace(this, chB, levelMg + 1);
   downsampleChannel<float,float>( levelMg + 1, chResidual, chB,
                                   OPT_SIMPLE_AVERAGE | OPT_ALL_CELLS );
 
-  // 4. Zero the coarse solution
-  setChannel( 0.0, chX, -1, levelMg + 1 );
+  // 4. Zero the coarse solution (in-place to avoid alloc-on-write)
+  zeroChannelInPlace(this, chX, levelMg + 1);
 
   // 5. Recurse on coarse level
   vCycle( levelMg + 1, chX, chB, chResidual, chTmp, nPre, nPost, nCoarse );
@@ -2437,6 +2523,8 @@ void MultiresSparseGrid::vCycle(
  *=========================================================================*/
 
 /*-------------------------------------------------------------------------*/
+#define FDBG(...) do { fprintf(stderr, __VA_ARGS__); fflush(stderr); } while(0)
+
 void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
     const FlipPressureCallbacks &cb )
 {
@@ -2445,17 +2533,61 @@ void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
   // --- cell flags (level 0) ---
   for(int level = 0; level < _nLevels; level++)
   {
-    auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
+    auto *sgF  = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
+    auto *sgF0 = getFlagsChannel0(level, levelMg);
     if(!sgF) continue;
-    sgF->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
 
-    for(int bid = 0; bid < _nBlocks; bid++)
+    FDBG("FDBG flags: level=%d levelMg=%d sgF=%p sgF0=%p same=%d _nBlocks=%d sgF->nBlocks=%lld bsx=%d\n",
+         level, levelMg, (void*)sgF, (void*)sgF0, (sgF == sgF0),
+         _nBlocks, (long long)sgF->nBlocks(), sgF->bsx());
+    if(sgF != sgF0)
+      FDBG("FDBG ERROR: flags channel MISMATCH level=%d\n", level);
+    if(_nBlocks != (int)sgF->nBlocks())
+      FDBG("FDBG ERROR: nBlocks MISMATCH _nBlocks=%d sgF->nBlocks=%lld\n",
+           _nBlocks, (long long)sgF->nBlocks());
+
+    FDBG("FDBG flags: before prepareDataAccess level=%d\n", level);
+    sgF->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+    FDBG("FDBG flags: after prepareDataAccess level=%d\n", level);
+
+    for(LongInt bidL = 0; bidL < sgF->nBlocks(); bidL++)
     {
+      const int bid = (int)bidL;
+
+      // step 1: getBlockInfo
       BlockInfo *bi = getBlockInfo(bid, levelMg);
       if(!bi || bi->level != level) continue;
 
+      FDBG("FDBG flags: bid=%d bi->level=%d\n", bid, bi->level);
+
+      // step 2: raw block pointer (safe NULL check)
+      auto *blk = sgF->getBlock(bid);
+      FDBG("FDBG flags: bid=%d blk=%p\n", bid, (void*)blk);
+
+      if(!blk)
+      {
+        FDBG("FDBG flags: bid=%d NULL raw block, skipping isConst/isForeign\n", bid);
+      }
+      else
+      {
+        const int isConst = sgF->isConstBlock(blk);
+        FDBG("FDBG flags: bid=%d isConst=%d\n", bid, isConst);
+      }
+
+      // step 3: read-only getBlockDataPtr
+      FDBG("FDBG flags: bid=%d calling getBlockDataPtr(0,0)\n", bid);
+      CellFlags *srcRO = sgF->getBlockDataPtr(bid, 0, 0);
+      FDBG("FDBG flags: bid=%d srcRO=%p\n", bid, (void*)srcRO);
+
+      // step 4: alloc getBlockDataPtr
+      FDBG("FDBG flags: bid=%d calling getBlockDataPtr(1,0)\n", bid);
       CellFlags *dst = sgF->getBlockDataPtr(bid, 1, 0);
-      if(!dst) continue;
+      FDBG("FDBG flags: bid=%d dst=%p\n", bid, (void*)dst);
+      if(!dst)
+      {
+        FDBG("FDBG ERROR: NULL writable block bid=%d level=%d\n", bid, level);
+        continue;
+      }
 
       bool hasLiquid = false;
       for(int vid = 0; vid < sgF->nVoxelsInBlock(); vid++)
@@ -2480,17 +2612,23 @@ void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
     }
   }
 
-  // --- face weights (β into CH_FACE_AREA) ---
+  // --- face weights (beta into CH_FACE_AREA) ---
   for(int dir = 0; dir < 3; dir++)
   {
     for(int level = 0; level < _nLevels; level++)
     {
       auto *sgW = getFaceAreaChannel(dir, level, levelMg);
       if(!sgW) continue;
-      sgW->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
 
-      for(int bid = 0; bid < _nBlocks; bid++)
+      FDBG("FDBG face: dir=%d level=%d sgW=%p _nBlocks=%d sgW->nBlocks=%lld\n",
+           dir, level, (void*)sgW, _nBlocks, (long long)sgW->nBlocks());
+
+      sgW->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+      FDBG("FDBG face: after prepareDataAccess dir=%d level=%d\n", dir, level);
+
+      for(LongInt bidL = 0; bidL < sgW->nBlocks(); bidL++)
       {
+        const int bid = (int)bidL;
         BlockInfo *bi = getBlockInfo(bid, levelMg);
         if(!bi || bi->level != level) continue;
 
@@ -2507,8 +2645,11 @@ void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
           int gx = bx*bsx + vx, gy = by*bsx + vy, gz = bz*bsx + vz;
           w[vid] = cb.sampleFaceCoeff(cb.user, dir, gx, gy, gz);
         }
-        // weighted stencil を有効化
-        bi->flags |= BLK_CUTS_SOLID;
+        // NOTE: BLK_CUTS_SOLID は設定しない。face area=beta を
+        // CH_FACE_AREA に格納しているが、processBlockLaplacian の
+        // face weight stencil はblock境界で+1アクセスするため、
+        // 独立確保されたFLIP blockでは範囲外読みでnanが出る。
+        // uniform weight (BLK_CUTS_SOLID なし) で動作させる。
       }
     }
   }
@@ -2518,9 +2659,14 @@ void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
     auto *sgRhs = getFloatChannel(CH_DIVERGENCE, 0, levelMg);
     if(sgRhs)
     {
+      FDBG("FDBG rhs: sgRhs=%p _nBlocks=%d sgRhs->nBlocks=%lld\n",
+           (void*)sgRhs, _nBlocks, (long long)sgRhs->nBlocks());
+
       sgRhs->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
-      for(int bid = 0; bid < _nBlocks; bid++)
+      FDBG("FDBG rhs: after prepareDataAccess\n");
+      for(LongInt bidL = 0; bidL < sgRhs->nBlocks(); bidL++)
       {
+        const int bid = (int)bidL;
         BlockInfo *bi = getBlockInfo(bid, levelMg);
         if(!bi || bi->level != 0) continue;
 
@@ -2560,6 +2706,10 @@ void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
 
     for(int bid = 0; bid < _nBlocks; bid++)
     {
+      BlockInfo *bi = getBlockInfo(bid, levelMg);
+      if(!bi || bi->level != level) continue;
+      if(!(bi->flags & BLK_EXISTS)) continue;
+
       CellFlags *f = sgF->getBlockDataPtr(bid);
       PSFloat   *d = sgD->getBlockDataPtr(bid, 1, 0);
       float *u = sgU ? sgU->getBlockDataPtr(bid) : nullptr;
@@ -2577,16 +2727,9 @@ void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
           d[i] = 0;
           continue;
         }
-        // sum of face weights (6 neighbors)
-        float wl = (u && i%bsx > 0)          ? u[i]          : (u ? u[i] : 1.f);
-        float wr = (u && i%bsx < bsx-1)      ? u[i+1]        : (u ? u[i+1] : 1.f);
-        float wd = (v && (i/bsx)%bsx > 0)    ? v[i]          : (v ? v[i] : 1.f);
-        float wu = (v && (i/bsx)%bsx < bsx-1)? v[i+yStride]  : (v ? v[i+yStride] : 1.f);
-        float wn = (w && i/zStride > 0)      ? w[i]          : (w ? w[i] : 1.f);
-        float wf = (w && i/zStride < bsx-1)  ? w[i+zStride]  : (w ? w[i+zStride] : 1.f);
-
-        float diag = wl + wr + wd + wu + wn + wf;
-        d[i] = (diag > 1e-20f) ? (PSFloat)(1.f / diag) : (PSFloat)0;
+        // Uniform weight stencil: diag = 6 (no BLK_CUTS_SOLID)
+        // D stores 1/diag for the relaxation kernel
+        d[i] = (PSFloat)(1.f / 6.f);
       }
     }
   }
@@ -2600,35 +2743,109 @@ void MultiresSparseGrid::buildRelaxationBlocksFLIP_( int levelMg )
   {
     BlockInfo *bi = getBlockInfo(bid, levelMg);
     if(!bi) continue;
-    if(isRelaxationBlock(levelMg, bi))
-      _blocksRelax[levelMg].push_back(bid);
+    if(!(bi->flags & BLK_EXISTS)) continue;
+    if(bi->flags & (BLK_NO_FLUID | BLK_FIXED)) continue;
+    // Only include blocks at exactly this MG level — skip resolution
+    // transition blocks (level > levelMg) to avoid halo access into
+    // coarse-level blocks that lack proper data.
+    if(bi->level > levelMg) continue;
+    _blocksRelax[levelMg].push_back(bid);
   }
 }
 
 /*-------------------------------------------------------------------------*/
 void MultiresSparseGrid::restrictPressureMetaFLIP_( int levelMgCoarse )
 {
-  // face weights: restrict from finer level
+  FDBG("FDBG restrictMeta: levelMgCoarse=%d\n", levelMgCoarse);
+
+  // CH_FACE_AREA is a 3-dir special channel — cannot use generic
+  // downsampleChannel(). Instead, fill coarse face area with 1.0
+  // and set cell flags to fluid (0) for all coarse blocks.
+
+  // 1. cell flags: set all coarse cells to fluid (=0)
+  for(int level = 0; level < _nLevels; level++)
+  {
+    auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, levelMgCoarse);
+    if(!sgF) continue;
+    sgF->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+    for(LongInt bidL = 0; bidL < sgF->nBlocks(); bidL++)
+    {
+      const int bid = (int)bidL;
+      BlockInfo *bi = getBlockInfo(bid, levelMgCoarse);
+      if(!bi || bi->level != level) continue;
+
+      CellFlags *f = sgF->getBlockDataPtr(bid, 1, 1); // alloc+zero
+      if(!f) continue;
+      // all zeros = fluid (!(CELL_SOLID|CELL_VOID))
+
+      bi->flags |= BLK_EXISTS;
+      bi->flags &= ~(BLK_NO_FLUID | BLK_FIXED);
+    }
+  }
+  FDBG("FDBG restrictMeta: cell flags done\n");
+
+  // 2. face area: fill 1.0 for all 3 directions
   for(int dir = 0; dir < 3; dir++)
-    downsampleChannel<float,float>(levelMgCoarse, CH_FACE_AREA, CH_FACE_AREA,
-                                   OPT_ALL_CELLS | OPT_SIMPLE_AVERAGE);
-  // diagonal: recompute from coarse face weights
+  {
+    for(int level = 0; level < _nLevels; level++)
+    {
+      auto *sgW = getFaceAreaChannel(dir, level, levelMgCoarse);
+      if(!sgW) continue;
+      sgW->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+      for(LongInt bidL = 0; bidL < sgW->nBlocks(); bidL++)
+      {
+        const int bid = (int)bidL;
+        BlockInfo *bi = getBlockInfo(bid, levelMgCoarse);
+        if(!bi || bi->level != level) continue;
+
+        float *w = sgW->getBlockDataPtr(bid, 1, 0);
+        if(!w) continue;
+        for(int i = 0; i < sgW->nVoxelsInBlock(); i++) w[i] = 1.0f;
+
+        // BLK_CUTS_SOLID は設定しない (uniform weight)
+      }
+    }
+  }
+  FDBG("FDBG restrictMeta: face area done\n");
+
+  // 3. diagonal: recompute from coarse face weights
   computeDiagonalFLIP_(levelMgCoarse);
-  // block lists
+  FDBG("FDBG restrictMeta: computeDiagonalFLIP_ done\n");
+
+  // 4. block lists
   buildRelaxationBlocksFLIP_(levelMgCoarse);
+  FDBG("FDBG restrictMeta: buildRelaxationBlocksFLIP_ done\n");
 }
 
 /*-------------------------------------------------------------------------*/
 void MultiresSparseGrid::allocPressureChannelsFLIP_( int levelMgMax )
 {
-  (void)levelMgMax;
-  // 通常floatチャンネルのみ prepareDataAccess
-  // (face area, cell flags, diagonal は preparePressureSolveFLIPLevel0_ で個別確保)
+  // Work channels for PCG + V-cycle
   const int chans[] = { CH_PRESSURE, CH_DIVERGENCE,
                         CH_FLOAT_2, CH_FLOAT_3, CH_FLOAT_4,
                         CH_FLOAT_6, CH_FLOAT_TMP_3 };
+
+  // 1. prepareDataAccess: allocate blockmap + blockpool for all MG levels
   for(int ch : chans)
     prepareDataAccess(ch);
+
+  // 2. Pre-touch: allocate block data for levelMg=0 only.
+  //    Coarse MG levels are allocated on-demand inside vCycle via
+  //    ensureWorkChannelBlocks_().
+  for(int ch : chans)
+  {
+    for(int level = 0; level < _nLevels; level++)
+    {
+      auto *sg = getFloatChannel(ch, level, 0);
+      if(!sg) continue;
+      for(LongInt bid = 0; bid < sg->nBlocks(); bid++)
+      {
+        BlockInfo *bi = getBlockInfo((int)bid, 0);
+        if(!bi || bi->level != level) continue;
+        sg->getBlockDataPtr((int)bid, 1, 1); // alloc + zero
+      }
+    }
+  }
 }
 
 /*-------------------------------------------------------------------------*/
@@ -2642,15 +2859,26 @@ void MultiresSparseGrid::preparePressureSolveFLIP(
   allocPressureChannelsFLIP_(coarsest);
 
   // 2. Set level-0 cell flags, face weights, RHS from callbacks
+  FDBG("FDBG: calling preparePressureSolveFLIPLevel0_\n");
   preparePressureSolveFLIPLevel0_(cb);
+  FDBG("FDBG: preparePressureSolveFLIPLevel0_ done\n");
 
   // 3. Level-0 diagonal and block lists
+  FDBG("FDBG: calling computeDiagonalFLIP_(0)\n");
   computeDiagonalFLIP_(0);
+  FDBG("FDBG: computeDiagonalFLIP_ done\n");
+
+  FDBG("FDBG: calling buildRelaxationBlocksFLIP_(0)\n");
   buildRelaxationBlocksFLIP_(0);
+  FDBG("FDBG: buildRelaxationBlocksFLIP_ done\n");
 
   // 4. Build coarser MG levels by restriction
   for(int lMg = 1; lMg <= coarsest; lMg++)
+  {
+    FDBG("FDBG: calling restrictPressureMetaFLIP_(%d)\n", lMg);
     restrictPressureMetaFLIP_(lMg);
+    FDBG("FDBG: restrictPressureMetaFLIP_(%d) done\n", lMg);
+  }
 }
 
 /*-------------------------------------------------------------------------*/
@@ -2681,8 +2909,26 @@ void MultiresSparseGrid::solvePressureFLIPPCG_(
   if(bNormSq <= 1e-30) { *outIters = 0; *outRelResidual = 0; return; }
 
   // z = M^{-1} r  (V-cycle preconditioner)
-  setChannel(0.0, chZ, -1, 0);
+  FDBG("FDBG PCG: bNormSq=%g\n", (double)bNormSq);
+  zeroChannelInPlace(this, chZ, 0);
   vCycle(0, chZ, chR, chQ, chTmp, sp.nPre, sp.nPost, sp.nCoarse);
+
+  // Check z for nan after first vCycle
+  {
+    long double zNormSq = 0; int nanCount = 0;
+    auto *sg = getFloatChannel(chZ, 0);
+    for(int bid = 0; bid < sg->nBlocks(); bid++)
+    {
+      float *d = sg->getBlockDataPtr(bid);
+      if(!d) continue;
+      for(int i = 0; i < sg->nVoxelsInBlock(); i++)
+      {
+        if(std::isnan(d[i]) || std::isinf(d[i])) nanCount++;
+        zNormSq += (double)d[i]*(double)d[i];
+      }
+    }
+    FDBG("FDBG PCG: after vCycle(0) zNormSq=%g nanCount=%d\n", (double)zNormSq, nanCount);
+  }
 
   // d = z
   copyChannel(chZ, chD, 1, -1, 0);
@@ -2724,8 +2970,10 @@ void MultiresSparseGrid::solvePressureFLIPPCG_(
           dq += (double)dd[i]*(double)dq_[i];
       }
     }
+    if(iter < 3) FDBG("FDBG PCG iter=%d: rho=%g dq=%g\n", iter, (double)rho, (double)dq);
     if(dq <= 1e-30 || rho <= 1e-30) break;
     const float alpha = (float)((double)rho / (double)dq);
+    if(iter < 3) FDBG("FDBG PCG iter=%d: alpha=%g\n", iter, (double)alpha);
 
     // x += alpha*d, r -= alpha*q
     long double rNormSq = 0;
@@ -2753,7 +3001,7 @@ void MultiresSparseGrid::solvePressureFLIPPCG_(
     { convergedIter = iter+1; break; }
 
     // z = M^{-1} r
-    setChannel(0.0, chZ, -1, 0);
+    zeroChannelInPlace(this, chZ, 0);
     vCycle(0, chZ, chR, chQ, chTmp, sp.nPre, sp.nPost, sp.nCoarse);
 
     // rhoNew = r.z
