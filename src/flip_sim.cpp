@@ -1040,8 +1040,13 @@ static float flipRhsCB(void *user, int x, int y, int z)
     return div / ctx->dt;
 }
 
-// 旧コード（互換性のため残す）
-static void buildMsbgPressureLevel0(
+// Phase 2 legacy code removed — see git history (ed5d638, 7e444b0)
+// buildMsbgPressureLevel0() and solvePressureMsbgPCG() were replaced
+// by the MSBG-internal callback-based API (preparePressureSolveFLIP /
+// solvePressureFLIP) in Phase 3.
+
+#if 0  // --- BEGIN REMOVED Phase 2 legacy code ---
+static void buildMsbgPressureLevel0_REMOVED(
     MSBG::MultiresSparseGrid *msbg,
     SBG::SparseGrid<Vec3Float> *sgVel,
     SBG::SparseGrid<float>     *sgMass,
@@ -1324,6 +1329,7 @@ static void solvePressureMsbgPCG(
                      maxIter, sqrt((double)finalRes/(double)bNormSq))); }
     }
 }
+#endif  // --- END REMOVED Phase 2 legacy code ---
 
 //=== 4. 圧力投影 ============================================================
 static void pressureProjection( MSBG::MultiresSparseGrid *msbg,
