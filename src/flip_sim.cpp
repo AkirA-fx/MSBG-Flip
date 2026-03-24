@@ -19,6 +19,7 @@
 #include <string.h>
 #include <vector>
 #include <algorithm>
+#include <queue>
 #include <tbb/tbb.h>
 #include "msbg.h"
 #include "bitmap.h"
@@ -194,6 +195,72 @@ static void saveParticleSlice(int step,int sx,int sy,int sz)
     char fname[256]; sprintf(fname,"c:/tmp/flip_frame_%04d.png",step);
     BmpSaveBitmapPNG(B,fname,NULL,0); BmpDeleteBitmap(&B);
     TRCP(("Saved %s\n",fname));
+}
+
+//=== §3.4 Adaptive Grid: refinement map =====================================
+static void buildRefinementMapFromParticles(
+    MSBG::MultiresSparseGrid *msbg,
+    std::vector<int> &blockLevels )
+{
+    SBG::SparseGrid<Vec3Float> *sg0=msbg->sg0();
+    const int nBlk=msbg->nBlocks();
+    const int nLevels=msbg->getNumLevels();
+    const int coarsest=nLevels-1;
+    blockLevels.assign(nBlk,coarsest);
+
+    // BFS: 液体ブロックからのblock距離を計算
+    const int INF=0x7fffffff;
+    std::vector<int> dist(nBlk,INF);
+    std::queue<int> q;
+
+    for(const FlipParticle &p:gParticles)
+    {
+        if(p.phase!=0) continue; // liquid only
+        int ix=(int)floorf(p.pos.x), iy=(int)floorf(p.pos.y), iz=(int)floorf(p.pos.z);
+        ix=std::max(0,std::min(ix,(int)sg0->sx()-1));
+        iy=std::max(0,std::min(iy,(int)sg0->sy()-1));
+        iz=std::max(0,std::min(iz,(int)sg0->sz()-1));
+        int bx,by,bz;
+        sg0->getBlockCoords(ix,iy,iz,bx,by,bz);
+        if(!sg0->blockCoordsInRange(bx,by,bz)) continue;
+        int bid=sg0->getBlockIndex(bx,by,bz);
+        if(dist[bid]==0) continue;
+        dist[bid]=0; q.push(bid);
+    }
+
+    // 26近傍で距離を伝播
+    while(!q.empty())
+    {
+        int bid=q.front(); q.pop();
+        int bx,by,bz;
+        sg0->getBlockCoordsById(bid,bx,by,bz);
+        int d=dist[bid];
+        if(d>=coarsest+1) continue;
+        for(int dz=-1;dz<=1;dz++) for(int dy=-1;dy<=1;dy++) for(int dx=-1;dx<=1;dx++)
+        {
+            if(dx==0&&dy==0&&dz==0) continue;
+            int bx2=bx+dx,by2=by+dy,bz2=bz+dz;
+            if(!sg0->blockCoordsInRange(bx2,by2,bz2)) continue;
+            int bid2=sg0->getBlockIndex(bx2,by2,bz2);
+            if(dist[bid2]<=d+1) continue;
+            dist[bid2]=d+1; q.push(bid2);
+        }
+    }
+
+    // 距離→レベル変換
+    for(int bid=0;bid<nBlk;bid++)
+    {
+        int d=dist[bid];
+        if(d<=1) blockLevels[bid]=0;
+        else if(nLevels>=2 && d==2) blockLevels[bid]=1;
+        else blockLevels[bid]=coarsest;
+    }
+    msbg->regularizeRefinementMap(blockLevels.data());
+
+    int cnt[3]={0,0,0};
+    for(int bid=0;bid<nBlk;bid++)
+    { int lv=blockLevels[bid]; if(lv<3) cnt[lv]++; }
+    TRCP(("  refinement: L0=%d L1=%d L2=%d / %d blocks\n",cnt[0],cnt[1],cnt[2],nBlk));
 }
 
 //=== 1. particles ============================================================
@@ -1011,7 +1078,28 @@ static void pressureProjection( SBG::SparseGrid<Vec3Float> *sgVel,
 }
 
 //=== 5. G2P =================================================================
-static void gridToParticle( SBG::SparseGrid<Vec3Float> *sgVel,
+// MSBG level-aware MAC補間: 粒子位置からblockのlevelを考慮
+// (Step 2: 現在は全block level=0で自前trilinearと同一結果)
+static float interpCompMSBG( MSBG::MultiresSparseGrid *msbg,
+                              SBG::SparseGrid<Vec3Float> *sg,
+                              float px,float py,float pz,
+                              float ox,float oy,float oz,int comp )
+{
+    // TODO: adaptive時はmsbg->getBlockInfo(bid)->levelに応じて
+    //       適切なlevelのSparseGridから読む。現在はlevel=0固定。
+    (void)msbg;
+    const float gx=px-ox,gy=py-oy,gz=pz-oz;
+    const int ix0=(int)floorf(gx),iy0=(int)floorf(gy),iz0=(int)floorf(gz);
+    const float fx=gx-ix0,fy=gy-iy0,fz=gz-iz0;
+    float sum=0.f;
+    for(int dz=0;dz<=1;dz++) for(int dy=0;dy<=1;dy++) for(int dx=0;dx<=1;dx++)
+        sum+=(dx?fx:1.f-fx)*(dy?fy:1.f-fy)*(dz?fz:1.f-fz)
+             *getVC(sg,ix0+dx,iy0+dy,iz0+dz,comp);
+    return sum;
+}
+
+static void gridToParticle( MSBG::MultiresSparseGrid *msbg,
+                            SBG::SparseGrid<Vec3Float> *sgVel,
                             SBG::SparseGrid<Vec3Float> *sgVelOld )
 {
     const float alpha=FLIP_ALPHA;
@@ -1021,12 +1109,12 @@ static void gridToParticle( SBG::SparseGrid<Vec3Float> *sgVel,
         for(size_t i=range.begin();i<range.end();i++)
         {
             FlipParticle &p=gParticles[i];
-            float picU=interpU(sgVel,   p.pos.x,p.pos.y,p.pos.z);
-            float picV=interpV(sgVel,   p.pos.x,p.pos.y,p.pos.z);
-            float picW=interpW(sgVel,   p.pos.x,p.pos.y,p.pos.z);
-            float oldU=interpU(sgVelOld,p.pos.x,p.pos.y,p.pos.z);
-            float oldV=interpV(sgVelOld,p.pos.x,p.pos.y,p.pos.z);
-            float oldW=interpW(sgVelOld,p.pos.x,p.pos.y,p.pos.z);
+            float picU=interpCompMSBG(msbg,sgVel,   p.pos.x,p.pos.y,p.pos.z,0.f,0.5f,0.5f,0);
+            float picV=interpCompMSBG(msbg,sgVel,   p.pos.x,p.pos.y,p.pos.z,0.5f,0.f,0.5f,1);
+            float picW=interpCompMSBG(msbg,sgVel,   p.pos.x,p.pos.y,p.pos.z,0.5f,0.5f,0.f,2);
+            float oldU=interpCompMSBG(msbg,sgVelOld,p.pos.x,p.pos.y,p.pos.z,0.f,0.5f,0.5f,0);
+            float oldV=interpCompMSBG(msbg,sgVelOld,p.pos.x,p.pos.y,p.pos.z,0.5f,0.f,0.5f,1);
+            float oldW=interpCompMSBG(msbg,sgVelOld,p.pos.x,p.pos.y,p.pos.z,0.5f,0.5f,0.f,2);
             p.vel.x=(1.f-alpha)*picU+alpha*(p.vel.x+(picU-oldU));
             p.vel.y=(1.f-alpha)*picV+alpha*(p.vel.y+(picV-oldV));
             p.vel.z=(1.f-alpha)*picW+alpha*(p.vel.z+(picW-oldW));
@@ -1065,63 +1153,106 @@ int flip_dam_break( int resolution, int blockSize, int nSteps )
 
     const int sx=ALIGN(resolution,blockSize),sy=sx,sz=sx;
 
+    // マルチ解像度対応: OPT_SINGLE_LEVEL を外し、3レベルで作成
+    // (Step 1: 全ブロック level=0 で既存動作を維持)
     MultiresSparseGrid *msbg=MultiresSparseGrid::create(
-        "FLIP_MAC",sx,sy,sz,blockSize,-1,0,-1,OPT_SINGLE_LEVEL);
+        "FLIP_MAC",sx,sy,sz,blockSize,-1,0,-1,
+        0,         // OPT_SINGLE_LEVEL を外す
+        NULL,NULL,
+        3          // 3 resolution levels
+    );
     if(!msbg){TRCERR(("create() failed\n"));return 1;}
 
+    TRCP(("MSBG: nLevels=%d nMgLevels=%d nBlocks=%d\n",
+          msbg->getNumLevels(),msbg->getNumMgLevels(),msbg->nBlocks()));
+
     msbg->setDomainBoundarySpec_(DBC_SOLID,DBC_SOLID,DBC_SOLID,DBC_OPEN,DBC_SOLID,DBC_SOLID);
-    { int nBlk=msbg->nBlocks(); std::vector<int> lv(nBlk,0);
-      msbg->regularizeRefinementMap(lv.data());
-      msbg->setRefinementMap(lv.data(),NULL,-1,NULL,false,true); }
 
-    msbg->prepareDataAccess(CH_VEC3_4);
-    msbg->prepareDataAccess(CH_VEC3_2);
-    msbg->prepareDataAccess(CH_VEC3_3);  // beta
-    msbg->prepareDataAccess(CH_FLOAT_1);
-    msbg->prepareDataAccess(CH_FLOAT_2);
-    msbg->prepareDataAccess(CH_FLOAT_3);
-    msbg->prepareDataAccess(CH_FLOAT_4);
-    msbg->prepareDataAccess(CH_FLOAT_6);
-    msbg->prepareDataAccess(CH_DIVERGENCE);
-    msbg->prepareDataAccess(CH_PRESSURE);
-
-    SBG::SparseGrid<Vec3Float> *sgVel   =msbg->getVecChannel(  CH_VEC3_4,      0);
-    SBG::SparseGrid<Vec3Float> *sgVelOld=msbg->getVecChannel(  CH_VEC3_2,      0);
-    SBG::SparseGrid<Vec3Float> *sgBeta  =msbg->getVecChannel(  CH_VEC3_3,0);
-    SBG::SparseGrid<float>     *sgMass  =msbg->getFloatChannel(CH_FLOAT_1,     0);
-    SBG::SparseGrid<float>     *sgR     =msbg->getFloatChannel(CH_FLOAT_2,     0);
-    SBG::SparseGrid<float>     *sgZ     =msbg->getFloatChannel(CH_FLOAT_3,     0);
-    SBG::SparseGrid<float>     *sgD     =msbg->getFloatChannel(CH_FLOAT_4,     0);
-    SBG::SparseGrid<float>     *sgQ     =msbg->getFloatChannel(CH_FLOAT_6,     0);
-    SBG::SparseGrid<float>     *sgDiv   =msbg->getFloatChannel(CH_DIVERGENCE,  0);
-    SBG::SparseGrid<float>     *sgP     =msbg->getFloatChannel(CH_PRESSURE,    0);
-
-    if(!sgVel||!sgVelOld||!sgBeta||!sgMass||!sgR||!sgZ||!sgD||!sgQ||!sgDiv||!sgP)
+    // チャンネル準備ヘルパー
+    auto prepareAllChannels=[&](){
+        msbg->prepareDataAccess(CH_VEC3_4);
+        msbg->prepareDataAccess(CH_VEC3_2);
+        msbg->prepareDataAccess(CH_VEC3_3);
+        msbg->prepareDataAccess(CH_FLOAT_1);
+        msbg->prepareDataAccess(CH_FLOAT_2);
+        msbg->prepareDataAccess(CH_FLOAT_3);
+        msbg->prepareDataAccess(CH_FLOAT_4);
+        msbg->prepareDataAccess(CH_FLOAT_6);
+        msbg->prepareDataAccess(CH_DIVERGENCE);
+        msbg->prepareDataAccess(CH_PRESSURE);
+    };
+    auto bindChannels=[&](
+        SBG::SparseGrid<Vec3Float>*&sgVel, SBG::SparseGrid<Vec3Float>*&sgVelOld,
+        SBG::SparseGrid<Vec3Float>*&sgBeta, SBG::SparseGrid<float>*&sgMass,
+        SBG::SparseGrid<float>*&sgR, SBG::SparseGrid<float>*&sgZ,
+        SBG::SparseGrid<float>*&sgD, SBG::SparseGrid<float>*&sgQ,
+        SBG::SparseGrid<float>*&sgDiv, SBG::SparseGrid<float>*&sgP)->bool
     {
-        if(!sgBeta)TRCERR(("sgBeta (CH_VEC3_3) is null\n"));
-        if(!sgR)   TRCERR(("sgR  (CH_FLOAT_2) is null\n"));
-        if(!sgZ)   TRCERR(("sgZ  (CH_FLOAT_3) is null\n"));
-        if(!sgD)   TRCERR(("sgD  (CH_FLOAT_4) is null\n"));
-        if(!sgQ)   TRCERR(("sgQ  (CH_FLOAT_6) is null\n"));
-        TRCERR(("Null channel pointer!\n"));
-        MultiresSparseGrid::destroy(msbg); return 1;
-    }
+        sgVel   =msbg->getVecChannel(  CH_VEC3_4,      0);
+        sgVelOld=msbg->getVecChannel(  CH_VEC3_2,      0);
+        sgBeta  =msbg->getVecChannel(  CH_VEC3_3,      0);
+        sgMass  =msbg->getFloatChannel(CH_FLOAT_1,     0);
+        sgR     =msbg->getFloatChannel(CH_FLOAT_2,     0);
+        sgZ     =msbg->getFloatChannel(CH_FLOAT_3,     0);
+        sgD     =msbg->getFloatChannel(CH_FLOAT_4,     0);
+        sgQ     =msbg->getFloatChannel(CH_FLOAT_6,     0);
+        sgDiv   =msbg->getFloatChannel(CH_DIVERGENCE,  0);
+        sgP     =msbg->getFloatChannel(CH_PRESSURE,    0);
+        return sgVel&&sgVelOld&&sgBeta&&sgMass&&sgR&&sgZ&&sgD&&sgQ&&sgDiv&&sgP;
+    };
+    auto touchAllBlocks=[&](SBG::SparseGrid<Vec3Float>*sgVel,
+        SBG::SparseGrid<Vec3Float>*sgVelOld, SBG::SparseGrid<Vec3Float>*sgBeta,
+        SBG::SparseGrid<float>*sgMass, SBG::SparseGrid<float>*sgR,
+        SBG::SparseGrid<float>*sgZ, SBG::SparseGrid<float>*sgD,
+        SBG::SparseGrid<float>*sgQ, SBG::SparseGrid<float>*sgDiv,
+        SBG::SparseGrid<float>*sgP)
+    {
+        for(int bid=0;bid<sgVel->nBlocks();bid++)
+        { sgVel->getBlockDataPtr(bid,1,1); sgVelOld->getBlockDataPtr(bid,1,1);
+          sgBeta->getBlockDataPtr(bid,1,1);
+          sgMass->getBlockDataPtr(bid,1,1); sgR->getBlockDataPtr(bid,1,1);
+          sgZ->getBlockDataPtr(bid,1,1); sgD->getBlockDataPtr(bid,1,1);
+          sgQ->getBlockDataPtr(bid,1,1); sgDiv->getBlockDataPtr(bid,1,1);
+          sgP->getBlockDataPtr(bid,1,1); }
+    };
 
-    for(int bid=0;bid<sgVel->nBlocks();bid++)
-    { sgVel->getBlockDataPtr(   bid,1,1); sgVelOld->getBlockDataPtr(bid,1,1);
-      sgBeta->getBlockDataPtr(  bid,1,1);
-      sgMass->getBlockDataPtr(  bid,1,1); sgR->getBlockDataPtr(     bid,1,1);
-      sgZ->getBlockDataPtr(     bid,1,1); sgD->getBlockDataPtr(     bid,1,1);
-      sgQ->getBlockDataPtr(     bid,1,1); sgDiv->getBlockDataPtr(   bid,1,1);
-      sgP->getBlockDataPtr(     bid,1,1); }
+    // 粒子初期化
+    initParticles(sx,sy,sz);
+
+    // §3.4: 初回 refinement map 構築
+    std::vector<int> refinementMap;
+    buildRefinementMapFromParticles(msbg,refinementMap);
+    msbg->setRefinementMap(refinementMap.data(),NULL,-1,NULL,false,true);
+    prepareAllChannels();
+
+    SBG::SparseGrid<Vec3Float> *sgVel,*sgVelOld,*sgBeta;
+    SBG::SparseGrid<float> *sgMass,*sgR,*sgZ,*sgD,*sgQ,*sgDiv,*sgP;
+    if(!bindChannels(sgVel,sgVelOld,sgBeta,sgMass,sgR,sgZ,sgD,sgQ,sgDiv,sgP))
+    { TRCERR(("Null channel pointer!\n")); MultiresSparseGrid::destroy(msbg); return 1; }
+    touchAllBlocks(sgVel,sgVelOld,sgBeta,sgMass,sgR,sgZ,sgD,sgQ,sgDiv,sgP);
 
     TRCP(("Grid: %dx%dx%d blocks=%d blockSize=%d\n",sx,sy,sz,(int)sgVel->nBlocks(),blockSize));
-    initParticles(sx,sy,sz);
 
     UtTimer tm, tm2;
     for(int step=0;step<nSteps;step++)
     {
         TIMER_START(&tm);
+
+        // §3.4: refinement map を毎step更新
+        {
+            std::vector<int> newMap;
+            buildRefinementMapFromParticles(msbg,newMap);
+            if(newMap!=refinementMap)
+            {
+                refinementMap.swap(newMap);
+                msbg->setRefinementMap(refinementMap.data(),NULL,-1,NULL,false,true);
+                prepareAllChannels();
+                if(!bindChannels(sgVel,sgVelOld,sgBeta,sgMass,sgR,sgZ,sgD,sgQ,sgDiv,sgP))
+                { TRCERR(("Null channel after regrid\n")); break; }
+                touchAllBlocks(sgVel,sgVelOld,sgBeta,sgMass,sgR,sgZ,sgD,sgQ,sgDiv,sgP);
+            }
+        }
+
         TIMER_START(&tm2);
         particleToGrid(    sgVel,sgMass,sgBeta);
         TIMER_STOP(&tm2); double t_p2g=TIMER_DIFF_MS(&tm2);
@@ -1132,7 +1263,7 @@ int flip_dam_break( int resolution, int blockSize, int nSteps )
         pressureProjection(sgVel,sgMass,sgDiv,sgP,sgR,sgZ,sgD,sgQ,sgBeta,DT);
         TIMER_STOP(&tm2); double t_press=TIMER_DIFF_MS(&tm2);
         TIMER_START(&tm2);
-        gridToParticle(    sgVel,sgVelOld);
+        gridToParticle(    msbg,sgVel,sgVelOld);
         TIMER_STOP(&tm2); double t_g2p=TIMER_DIFF_MS(&tm2);
         TIMER_START(&tm2);
         advectParticles(   sx,sy,sz,DT);
