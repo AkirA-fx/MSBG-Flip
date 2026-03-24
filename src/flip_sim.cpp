@@ -45,8 +45,8 @@ static const float RHO_G       = 1.0f;
 static const float ALPHA_PHI   = 1.0f;
 static const float BETA_MIN    = 1e-6f;  // β下限ガード（ゼロ除算/数値不安定防止）
 
-// Step 4: ソルバー選択
-enum class PressureSolverKind { MIC0_PCG, HYPRE_AMG_PCG };
+// Step 4/6: ソルバー選択
+enum class PressureSolverKind { MIC0_PCG, HYPRE_AMG_PCG, MSBG_VCYCLE_PCG };
 static PressureSolverKind gSolverKind = PressureSolverKind::HYPRE_AMG_PCG;
 
 struct FlipParticle { Vec3Float pos, vel; int phase; /* 0=liquid 1=air */ };
@@ -1005,8 +1005,297 @@ static void solvePressureHypreAMG(PressureSystem &sys, float tol, int maxIter)
             (int)numIter,finalRelRes,needSetup?"yes":"skip")); }
 }
 
-//=== 4. 圧力投影（compact版）================================================
-static void pressureProjection( SBG::SparseGrid<Vec3Float> *sgVel,
+//=== Step 6: MSBG native V-cycle PCG solver ================================
+
+// MSBGチャンネルに圧力系を設定
+// Cell flags, divergence, face area, diagonal をセットアップ
+static void buildMsbgPressureLevel0(
+    MSBG::MultiresSparseGrid *msbg,
+    SBG::SparseGrid<Vec3Float> *sgVel,
+    SBG::SparseGrid<float>     *sgMass,
+    SBG::SparseGrid<Vec3Float> *sgBeta,
+    float dt )
+{
+    using namespace MSBG;
+    (void)sgBeta; // TODO: faceCoeff対応時に使用
+
+    SBG::SparseGrid<float> *sgDiv = msbg->getFloatChannel(CH_DIVERGENCE, 0);
+    SBG::SparseGrid<float> *sgP   = msbg->getFloatChannel(CH_PRESSURE, 0);
+    const int nx = sgMass->sx(), ny = sgMass->sy(), nz = sgMass->sz();
+
+    // Cell flags / Face area / Diagonal を全MG levelで初期化
+    // processBlockLaplacian が getBlockDataPtr(bid) で直接参照するため
+    // constant block (NULL) ではsegfaultする → 全blockにデータ割り当て必須
+    const int nLev = msbg->getNumLevels();  // sparse levels
+
+    // Helper lambda: sparse grid の全blockにデータを割り当てて値を埋める
+    auto fillSG = [](SBG::SparseGrid<float> *sg, float val) {
+        if(!sg) return;
+        sg->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+        for(int bid = 0; bid < sg->nBlocks(); bid++) {
+            float *d = sg->getBlockDataPtr(bid, 1, 0);
+            if(!d) continue;
+            for(int i = 0; i < sg->nVoxelsInBlock(); i++) d[i] = val;
+        }
+    };
+    auto fillFlagsSG = [](SBG::SparseGrid<CellFlags> *sg) {
+        if(!sg) return;
+        sg->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+        for(int bid = 0; bid < sg->nBlocks(); bid++)
+        {
+            CellFlags *d = sg->getBlockDataPtr(bid, 1, 0);
+            if(!d) continue;
+            memset(d, 0, sg->nVoxelsInBlock() * sizeof(CellFlags));
+        }
+    };
+
+    // Sparse levels: (level, levelMg) where level >= levelMg
+    for(int lMg = 0; lMg < nLev; lMg++)
+    {
+        for(int level = lMg; level < nLev; level++)
+        {
+            auto *sgF = msbg->getFlagsChannel(CH_CELL_FLAGS, level, lMg);
+            fillFlagsSG(sgF);
+            for(int dir = 0; dir < 3; dir++)
+                fillSG(msbg->getFaceAreaChannel(dir, level, lMg), 1.0f);
+            fillSG(msbg->getFloatChannel(CH_DIAGONAL, level, lMg), 1.0f/6.0f);
+        }
+    }
+    // V-cycle作業チャンネルをlevelMg=0で事前確保
+    // （V-cycleの再帰はsetChannel/downsampleChannel経由で上位MGレベルのblockを確保する）
+    {
+        const int workChans[] = { CH_PRESSURE, CH_DIVERGENCE,
+                                  CH_FLOAT_2, CH_FLOAT_3, CH_FLOAT_4,
+                                  CH_FLOAT_6, CH_FLOAT_TMP_3 };
+        for(int chan : workChans)
+        {
+            for(int level = 0; level < nLev; level++)
+            {
+                auto *sg = msbg->getFloatChannel(chan, level, 0);
+                if(!sg) continue;
+                sg->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+                for(int bid = 0; bid < sg->nBlocks(); bid++)
+                    sg->getBlockDataPtr(bid, 1, 0);
+            }
+        }
+    }
+
+    // Divergence (MAC) と pressure を初期化
+    zeroFloatChannel(sgDiv);
+    zeroFloatChannel(sgP);
+
+    for(int iz=0;iz<nz;iz++) for(int iy=0;iy<ny;iy++) for(int ix=0;ix<nx;ix++)
+    {
+        if(!isFluid(sgMass,ix,iy,iz)) continue;
+        const float div =
+            getVC(sgVel,ix+1,iy,  iz,  0)-getVC(sgVel,ix,iy,iz,0)+
+            getVC(sgVel,ix,  iy+1,iz,  1)-getVC(sgVel,ix,iy,iz,1)+
+            getVC(sgVel,ix,  iy,  iz+1,2)-getVC(sgVel,ix,iy,iz,2);
+        setF(sgDiv,ix,iy,iz, div/dt);
+    }
+
+    // _blocksRelax リスト構築: relax() が使用するblock一覧
+    // isRelaxationBlock() の条件: !(BLK_NO_FLUID|BLK_FIXED) && level<=levelMg
+    for(int lMg = 0; lMg < nLev; lMg++)
+    {
+        msbg->_blocksRelax[lMg].clear();
+        for(int bid = 0; bid < msbg->nBlocks(); bid++)
+        {
+            MSBG::BlockInfo *bi = msbg->getBlockInfo(bid, lMg);
+            if(!bi) continue;
+            if(msbg->isRelaxationBlock(lMg, bi))
+                msbg->_blocksRelax[lMg].push_back(bid);
+        }
+    }
+}
+
+// MSBG V-cycle PCG solver: PCG外側 + V-cycle preconditioner
+static void solvePressureMsbgPCG(
+    MSBG::MultiresSparseGrid *msbg,
+    float tol, int maxIter )
+{
+    using namespace MSBG;
+
+    // チャンネル割当:
+    //   CH_PRESSURE     = x (solution)
+    //   CH_DIVERGENCE   = b (rhs, level 0のみ)
+    //   CH_FLOAT_2      = r (residual)
+    //   CH_FLOAT_3      = z (preconditioned residual)
+    //   CH_FLOAT_4      = d (search direction)
+    //   CH_FLOAT_6      = q (A*d)
+    //   CH_FLOAT_TMP_PS = tmp (relax swap buffer)
+    //   CH_CG_P, CH_CG_Q = V-cycle内部作業用（coarseレベル）
+
+    const int chX   = CH_PRESSURE;
+    const int chB   = CH_DIVERGENCE;
+    const int chR   = CH_FLOAT_2;       // residual
+    const int chZ   = CH_FLOAT_3;       // preconditioned residual
+    const int chD   = CH_FLOAT_4;       // search direction
+    const int chQ   = CH_FLOAT_6;       // q = A*d
+    const int chTmp = CH_FLOAT_TMP_3;   // relax temp (別CH_FLOAT_2=chRとの衝突回避)
+
+    // Note: prepare() は cell flags を上書きするため呼ばない
+    // cell flags / face area / diagonal は buildMsbgPressureLevel0 で設定済み
+
+    // x = 0 (already zero from buildMsbgPressureLevel0)
+
+    // r = b - A*x = b (since x=0)
+    msbg->copyChannel(chB, chR, 1, -1, 0);
+
+    // Compute |b|^2
+    long double bNormSq = 0.0;
+    {
+        SBG::SparseGrid<float> *sgR = msbg->getFloatChannel(chR, 0);
+        for(int bid = 0; bid < sgR->nBlocks(); bid++)
+        {
+            float *d = sgR->getBlockDataPtr(bid);
+            if(!d) continue;
+            for(int i = 0; i < sgR->nVoxelsInBlock(); i++)
+                bNormSq += (double)d[i] * (double)d[i];
+        }
+    }
+    if(bNormSq <= 1e-30) return;
+
+    // z = M^{-1} r  (1 V-cycle as preconditioner)
+    msbg->setChannel(0.0, chZ, -1, 0);
+    msbg->vCycle(0, chZ, chR, chQ, chTmp, 2, 2, 24);
+
+    // d = z
+    msbg->copyChannel(chZ, chD, 1, -1, 0);
+
+    // rho = r . z
+    long double rho = 0.0;
+    {
+        SBG::SparseGrid<float> *sgR = msbg->getFloatChannel(chR, 0);
+        SBG::SparseGrid<float> *sgZ = msbg->getFloatChannel(chZ, 0);
+        for(int bid = 0; bid < sgR->nBlocks(); bid++)
+        {
+            float *dr = sgR->getBlockDataPtr(bid);
+            float *dz = sgZ->getBlockDataPtr(bid);
+            if(!dr || !dz) continue;
+            for(int i = 0; i < sgR->nVoxelsInBlock(); i++)
+                rho += (double)dr[i] * (double)dz[i];
+        }
+    }
+
+    const double tolSq = (double)tol * (double)tol;
+    int convergedIter = -1;
+
+    for(int iter = 0; iter < maxIter; iter++)
+    {
+        // q = A * d
+        msbg->multiplyLaplacianMatrixOpt(
+            0, 0, chD, CH_NULL, 0.0f, chQ, nullptr, nullptr);
+
+        // alpha = rho / (d . q)
+        long double dq = 0.0;
+        {
+            SBG::SparseGrid<float> *sgD = msbg->getFloatChannel(chD, 0);
+            SBG::SparseGrid<float> *sgQ = msbg->getFloatChannel(chQ, 0);
+            for(int bid = 0; bid < sgD->nBlocks(); bid++)
+            {
+                float *dd = sgD->getBlockDataPtr(bid);
+                float *dq_ = sgQ->getBlockDataPtr(bid);
+                if(!dd || !dq_) continue;
+                for(int i = 0; i < sgD->nVoxelsInBlock(); i++)
+                    dq += (double)dd[i] * (double)dq_[i];
+            }
+        }
+        if(dq <= 1e-30 || rho <= 1e-30) break;
+
+        const float alpha = (float)((double)rho / (double)dq);
+
+        // x += alpha * d,  r -= alpha * q
+        long double rNormSq = 0.0;
+        {
+            SBG::SparseGrid<float> *sgX = msbg->getFloatChannel(chX, 0);
+            SBG::SparseGrid<float> *sgR = msbg->getFloatChannel(chR, 0);
+            SBG::SparseGrid<float> *sgD = msbg->getFloatChannel(chD, 0);
+            SBG::SparseGrid<float> *sgQ = msbg->getFloatChannel(chQ, 0);
+            for(int bid = 0; bid < sgX->nBlocks(); bid++)
+            {
+                float *dx = sgX->getBlockDataPtr(bid);
+                float *dr = sgR->getBlockDataPtr(bid);
+                float *dd = sgD->getBlockDataPtr(bid);
+                float *dq_ = sgQ->getBlockDataPtr(bid);
+                if(!dx || !dr) continue;
+                for(int i = 0; i < sgX->nVoxelsInBlock(); i++)
+                {
+                    if(dd) dx[i] += alpha * dd[i];
+                    if(dq_) dr[i] -= alpha * dq_[i];
+                    rNormSq += (double)dr[i] * (double)dr[i];
+                }
+            }
+        }
+
+        if(rNormSq <= tolSq * bNormSq)
+        {
+            convergedIter = iter + 1;
+            break;
+        }
+
+        // z = M^{-1} r  (V-cycle preconditioner)
+        msbg->setChannel(0.0, chZ, -1, 0);
+        msbg->vCycle(0, chZ, chR, chQ, chTmp, 2, 2, 24);
+
+        // rhoNew = r . z
+        long double rhoNew = 0.0;
+        {
+            SBG::SparseGrid<float> *sgR = msbg->getFloatChannel(chR, 0);
+            SBG::SparseGrid<float> *sgZ = msbg->getFloatChannel(chZ, 0);
+            for(int bid = 0; bid < sgR->nBlocks(); bid++)
+            {
+                float *dr = sgR->getBlockDataPtr(bid);
+                float *dz = sgZ->getBlockDataPtr(bid);
+                if(!dr || !dz) continue;
+                for(int i = 0; i < sgR->nVoxelsInBlock(); i++)
+                    rhoNew += (double)dr[i] * (double)dz[i];
+            }
+        }
+        if(rho <= 1e-30) break;
+
+        const float beta = (float)((double)rhoNew / (double)rho);
+
+        // d = z + beta * d
+        {
+            SBG::SparseGrid<float> *sgZ = msbg->getFloatChannel(chZ, 0);
+            SBG::SparseGrid<float> *sgD = msbg->getFloatChannel(chD, 0);
+            for(int bid = 0; bid < sgZ->nBlocks(); bid++)
+            {
+                float *dz = sgZ->getBlockDataPtr(bid);
+                float *dd = sgD->getBlockDataPtr(bid);
+                if(!dz || !dd) continue;
+                for(int i = 0; i < sgZ->nVoxelsInBlock(); i++)
+                    dd[i] = dz[i] + beta * dd[i];
+            }
+        }
+
+        rho = rhoNew;
+    }
+
+    {
+        long double finalRes = 0.0;
+        SBG::SparseGrid<float> *sgR = msbg->getFloatChannel(chR, 0);
+        for(int bid = 0; bid < sgR->nBlocks(); bid++)
+        {
+            float *dr = sgR->getBlockDataPtr(bid);
+            if(!dr) continue;
+            for(int i = 0; i < sgR->nVoxelsInBlock(); i++)
+                finalRes += (double)dr[i] * (double)dr[i];
+        }
+
+        if(convergedIter > 0)
+            { TRCP(("  MG-PCG converged in %d iter  |r|/|b|=%.2e\n",
+                     convergedIter, sqrt((double)finalRes/(double)bNormSq))); }
+        else
+            { TRCP(("  MG-PCG: maxIter=%d reached  |r|/|b|=%.2e\n",
+                     maxIter, sqrt((double)finalRes/(double)bNormSq))); }
+    }
+}
+
+//=== 4. 圧力投影 ============================================================
+static void pressureProjection( MSBG::MultiresSparseGrid *msbg,
+                                SBG::SparseGrid<Vec3Float> *sgVel,
                                 SBG::SparseGrid<float>     *sgMass,
                                 SBG::SparseGrid<float>     *sgDiv,
                                 SBG::SparseGrid<float>     *sgP,
@@ -1018,32 +1307,42 @@ static void pressureProjection( SBG::SparseGrid<Vec3Float> *sgVel,
                                 float dt )
 {
     (void)sgR; (void)sgZ; (void)sgD; (void)sgQ; // compact版では未使用
-
-    zeroFloatChannel(sgDiv); zeroFloatChannel(sgP);
     const int nx=sgMass->sx(),ny=sgMass->sy(),nz=sgMass->sz();
 
-    // MAC 発散
-    for(int iz=0;iz<nz;iz++) for(int iy=0;iy<ny;iy++) for(int ix=0;ix<nx;ix++)
+    if(gSolverKind == PressureSolverKind::MSBG_VCYCLE_PCG)
     {
-        if(!isFluid(sgMass,ix,iy,iz)) continue;
-        const float div=
-            getVC(sgVel,ix+1,iy,  iz,  0)-getVC(sgVel,ix,iy,iz,0)+
-            getVC(sgVel,ix,  iy+1,iz,  1)-getVC(sgVel,ix,iy,iz,1)+
-            getVC(sgVel,ix,  iy,  iz+1,2)-getVC(sgVel,ix,iy,iz,2);
-        setF(sgDiv,ix,iy,iz,div/dt);
+        // MSBG native solver: チャンネルに圧力系を設定 → V-cycle PCGで解く
+        buildMsbgPressureLevel0(msbg, sgVel, sgMass, sgBeta, dt);
+        solvePressureMsbgPCG(msbg, PCG_TOL, PCG_MAXITER);
+        // 結果は CH_PRESSURE に直接書かれている（sgP と同一）
     }
-
-    // compact 圧力系を構築
-    buildPressureSystem(sgMass,sgBeta,sgDiv,dt,gPSys);
-
-    // ソルバー選択
-    if(gSolverKind==PressureSolverKind::HYPRE_AMG_PCG)
-        solvePressureHypreAMG(gPSys,PCG_TOL,PCG_MAXITER);
     else
-        solvePressureCompactPCG(gPSys,PCG_TOL,PCG_MAXITER);
+    {
+        zeroFloatChannel(sgDiv); zeroFloatChannel(sgP);
 
-    // 解をグリッドに書き戻す
-    scatterPressureToGrid(gPSys,sgP);
+        // MAC 発散
+        for(int iz=0;iz<nz;iz++) for(int iy=0;iy<ny;iy++) for(int ix=0;ix<nx;ix++)
+        {
+            if(!isFluid(sgMass,ix,iy,iz)) continue;
+            const float div=
+                getVC(sgVel,ix+1,iy,  iz,  0)-getVC(sgVel,ix,iy,iz,0)+
+                getVC(sgVel,ix,  iy+1,iz,  1)-getVC(sgVel,ix,iy,iz,1)+
+                getVC(sgVel,ix,  iy,  iz+1,2)-getVC(sgVel,ix,iy,iz,2);
+            setF(sgDiv,ix,iy,iz,div/dt);
+        }
+
+        // compact 圧力系を構築
+        buildPressureSystem(sgMass,sgBeta,sgDiv,dt,gPSys);
+
+        // ソルバー選択
+        if(gSolverKind==PressureSolverKind::HYPRE_AMG_PCG)
+            solvePressureHypreAMG(gPSys,PCG_TOL,PCG_MAXITER);
+        else
+            solvePressureCompactPCG(gPSys,PCG_TOL,PCG_MAXITER);
+
+        // 解をグリッドに書き戻す
+        scatterPressureToGrid(gPSys,sgP);
+    }
 
     // 圧力勾配補正 U (可変密度: u -= dt * beta * dp/dx)
     for(int iz=0;iz<nz;iz++) for(int iy=0;iy<ny;iy++) for(int ix=0;ix<=nx;ix++)
@@ -1180,6 +1479,8 @@ int flip_dam_break( int resolution, int blockSize, int nSteps )
         msbg->prepareDataAccess(CH_FLOAT_6);
         msbg->prepareDataAccess(CH_DIVERGENCE);
         msbg->prepareDataAccess(CH_PRESSURE);
+        // Step 6: V-cycle solver用追加チャンネル
+        msbg->prepareDataAccess(CH_FLOAT_TMP_3); // relax temp
     };
     auto bindChannels=[&](
         SBG::SparseGrid<Vec3Float>*&sgVel, SBG::SparseGrid<Vec3Float>*&sgVelOld,
@@ -1213,7 +1514,10 @@ int flip_dam_break( int resolution, int blockSize, int nSteps )
           sgMass->getBlockDataPtr(bid,1,1); sgR->getBlockDataPtr(bid,1,1);
           sgZ->getBlockDataPtr(bid,1,1); sgD->getBlockDataPtr(bid,1,1);
           sgQ->getBlockDataPtr(bid,1,1); sgDiv->getBlockDataPtr(bid,1,1);
-          sgP->getBlockDataPtr(bid,1,1); }
+          sgP->getBlockDataPtr(bid,1,1);
+          // Step 6: relax temp
+          SBG::SparseGrid<float> *sgTmp3=msbg->getFloatChannel(CH_FLOAT_TMP_3,0);
+          if(sgTmp3) sgTmp3->getBlockDataPtr(bid,1,1); }
     };
 
     // 粒子初期化
@@ -1260,7 +1564,7 @@ int flip_dam_break( int resolution, int blockSize, int nSteps )
         applyGravity(      sgVel,sgVelOld,sgMass,DT);
         TIMER_STOP(&tm2); double t_grav=TIMER_DIFF_MS(&tm2);
         TIMER_START(&tm2);
-        pressureProjection(sgVel,sgMass,sgDiv,sgP,sgR,sgZ,sgD,sgQ,sgBeta,DT);
+        pressureProjection(msbg,sgVel,sgMass,sgDiv,sgP,sgR,sgZ,sgD,sgQ,sgBeta,DT);
         TIMER_STOP(&tm2); double t_press=TIMER_DIFF_MS(&tm2);
         TIMER_START(&tm2);
         gridToParticle(    msbg,sgVel,sgVelOld);

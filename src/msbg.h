@@ -2210,7 +2210,19 @@ class MultiresSparseGrid
   void downsampleChannel( int levelMg,  // target level
 			  int chSrc,
 			  int chDst,
-			  unsigned options = 0			  
+			  unsigned options = 0
+			  );
+
+  // Prolongation: coarse -> fine copy-add (inverse of downsampleChannel)
+  // levelMgFine = target fine MG level
+  // Reads chSrc at levelMgFine+1, adds alpha*value into chDst at levelMgFine
+  // MG_CONST_PROLONGATION: 2x2x2 constant interpolation (piecewise constant)
+  template<typename data_T>
+  void prolongateChannel( int levelMgFine,
+			  int chSrc,
+			  int chDst,
+			  unsigned options = 0,
+			  float alpha = MG_CONST_PROLONGATION_ALPHA
 			  );
 
   void downsampleVelocity( int levelMg,  // target level
@@ -3268,13 +3280,26 @@ class MultiresSparseGrid
 
   void relax(  int boundaryZoneOnly,
       		  int reverseOrder,
-      			     int levelMg,     					    
+      			     int levelMg,
 			     int chanX,
 			     int chanB,
 			     int chanTmp,
 			     int nIter,
 			     unsigned options=0
 			     );
+
+  // V-cycle multigrid: pre-smooth -> residual -> restrict -> coarse solve -> prolongate -> post-smooth
+  // chX = solution (in/out), chB = rhs (read-only at this level)
+  // chResidual, chTmp = work channels
+  void vCycle( int levelMg,
+	       int chX,
+	       int chB,
+	       int chResidual,
+	       int chTmp,
+	       int nPre = 2,
+	       int nPost = 2,
+	       int nCoarse = 24
+	       );
 
   void setChannel( double a, int iChanDstY,
       		    int levelMax=-1, int levelMg=0, CellFlags cellMask=0,

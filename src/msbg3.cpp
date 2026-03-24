@@ -1198,7 +1198,7 @@ void MultiresSparseGrid::IprocessBlockLaplacian(
         #endif
 
 
-	if(( blockHasSkippableSIMD && (tmpDataF[iSimd] & (1<<1) ))) 
+	if(( blockHasSkippableSIMD && (tmpDataF[iSimd] & (1<<1) )))
 	{
 	  #ifdef SKIP_NONFLUID_SIMD_STATS
 	  skipstats.update(1);
@@ -1832,9 +1832,9 @@ void MultiresSparseGrid::multiplyLaplacianMatrixOpt(
 
   // Initialze per-thread data
   processBlockLaplacian<LAPL_MULTIPLY|LAPL_INIT_THREAD_LOCALS>
-    (-1,0,0,0,0,0,NULL,0,0,0,0,0,NULL);  
+    (-1,0,0,0,0,0,NULL,0,0,0,0,0,NULL);
 
-  // 
+  //
   // Main loop over all blocks
   //
   typedef struct
@@ -1845,20 +1845,19 @@ void MultiresSparseGrid::multiplyLaplacianMatrixOpt(
 
   int nActBlocks = blockList ? blockList->size() : _nBlocks;
 
-  ThrRunParallel<ThreadLocals>( nActBlocks, 
-    [&]( ThreadLocals &tls, int tid )  
+  ThrRunParallel<ThreadLocals>( nActBlocks,
+    [&]( ThreadLocals &tls, int tid )
     {
       tls.alpha = 0;
     },
 
-    [&](ThreadLocals &tls, int tid, int bid) 
+    [&](ThreadLocals &tls, int tid, int bid)
     {
       if(blockList) bid = (*blockList)[bid];
       UT_ASSERT2(bid>=0&&bid<_nBlocks);
 
       BlockInfo *bi = getBlockInfo(bid,levelMg);
-
-      if((doBoundZoneOnly) && !(bi->flags & BLK_BOUNDARY_ZONE)) 
+      if((doBoundZoneOnly) && !(bi->flags & BLK_BOUNDARY_ZONE))
       {
 	return;
       }
@@ -2217,7 +2216,7 @@ LongInt MultiresSparseGrid::relaxBlockList(
 	}
 	#endif
 
-	processBlockLaplacian<LAPL_RELAX>( 
+	processBlockLaplacian<LAPL_RELAX>(
 	    	    tid, options, bid, bx, by, bz, bi, levelMg, 
 		    chanX, chanB, chanDstY, 
 		    _mgSmBlockIter, NULL );
@@ -2320,7 +2319,6 @@ void MultiresSparseGrid::relax(   int boundaryZoneOnly,
     {
       blocksRelax = &_blocksRelax[levelMg];
     }
-
     #ifdef RELAX_BLOCKS_RED_BLACK
     int chRead = chanX,
         chWrite = chanX;
@@ -2366,6 +2364,72 @@ void MultiresSparseGrid::relax(   int boundaryZoneOnly,
   #ifdef CHECK_NONFLUID_ZERO_POST
   checkChannelNonFluidZero(chanX,levelMg);
   #endif
+}
+
+/*-------------------------------------------------------------------------*/
+/* V-cycle multigrid solver / preconditioner                               */
+/* chX = solution (in/out), chB = rhs (read-only at this level)            */
+/* chResidual, chTmp = work channels                                       */
+/*                                                                         */
+/* Channel usage per level:                                                */
+/*   chX       - solution (zero-initialized on entry for correction)       */
+/*   chB       - right-hand side                                           */
+/*   chResidual - residual r = b - Ax, also used as coarse RHS             */
+/*   chTmp     - temporary for relax (swap buffer)                         */
+/*-------------------------------------------------------------------------*/
+void MultiresSparseGrid::vCycle(
+    int levelMg,
+    int chX,
+    int chB,
+    int chResidual,
+    int chTmp,
+    int nPre,
+    int nPost,
+    int nCoarse )
+{
+  // Dense level はチャンネル管理が異なるため、sparse levelのみ使用
+  const int coarsest = getNumLevels() - 1;
+
+  // Base case: coarsest level — direct solve via relaxation
+  if(levelMg >= coarsest)
+  {
+    relax( 0, 0, levelMg, chX, chB, chTmp, nCoarse, 0 );
+    return;
+  }
+
+  // 1. Pre-smoothing
+  relax( 0, 0, levelMg, chX, chB, chTmp, nPre, 0 );
+
+  // 2. Compute residual: chResidual = chB - A * chX
+  multiplyLaplacianMatrixOpt(
+      OPT_CALC_RESIDUAL,
+      levelMg,
+      chX,           // current solution
+      chB,           // right-hand side
+      0.0f,          // no diffusion
+      chResidual,    // output: r = b - Ax
+      nullptr,       // no dot product
+      nullptr        // all blocks
+  );
+
+  // 3. Restrict residual to coarse level: coarse_rhs = R * residual
+  //    Use chB at coarse level as the coarse RHS
+  setChannel( 0.0, chB, -1, levelMg + 1 );
+  downsampleChannel<float,float>( levelMg + 1, chResidual, chB,
+                                  OPT_SIMPLE_AVERAGE | OPT_ALL_CELLS );
+
+  // 4. Zero the coarse solution
+  setChannel( 0.0, chX, -1, levelMg + 1 );
+
+  // 5. Recurse on coarse level
+  vCycle( levelMg + 1, chX, chB, chResidual, chTmp, nPre, nPost, nCoarse );
+
+  // 6. Prolongate coarse correction and add to fine solution: x += P * e_c
+  prolongateChannel<float>( levelMg, chX, chX, 0,
+                            MG_CONST_PROLONGATION_ALPHA );
+
+  // 7. Post-smoothing (reverse order for symmetry)
+  relax( 0, 1 /*reverseOrder*/, levelMg, chX, chB, chTmp, nPost, 0 );
 }
 
 } // namespace MSBG
