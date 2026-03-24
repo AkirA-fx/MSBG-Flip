@@ -825,11 +825,36 @@ using namespace SBG;
 /*-----------------------------------------------------------------------*/
 /* 									 */
 /*-----------------------------------------------------------------------*/
+// FLIP pressure solver callback interface
+struct FlipPressureCallbacks
+{
+  CellFlags (*sampleCellType)(void *user, int x, int y, int z);
+  float (*sampleFaceCoeff)(void *user, int dir, int x, int y, int z);
+  float (*sampleRhs)(void *user, int x, int y, int z);
+  void *user;
+};
+
+struct FlipPressureSolveParams
+{
+  int nPre         = 2;
+  int nPost        = 2;
+  int nCoarse      = 24;
+  int maxIter      = 80;
+  float tol        = 1e-5f;
+};
+
 class MultiresSparseGrid
 {
   public:
   class BlockIterator;
 //  class EikonalSolver;
+
+  // FLIP pressure solver: prepare internal state (cell flags, face weights,
+  // diagonal, block lists, channel allocation) then solve via MG-PCG.
+  void preparePressureSolveFLIP( const FlipPressureCallbacks &cb,
+                                 unsigned options = 0 );
+  int  solvePressureFLIP( const FlipPressureSolveParams &params,
+                          float *outRelResidual = nullptr );
 
   static
   MultiresSparseGrid *create( 
@@ -3444,6 +3469,15 @@ class MultiresSparseGrid
 		   _blocksValue[MSBG_MAXRESLEVELS];
 
   int _mgArActNumIter[MSBG_MAXRESLEVELS];
+
+  // FLIP pressure solver helpers
+  void preparePressureSolveFLIPLevel0_( const FlipPressureCallbacks &cb );
+  void restrictPressureMetaFLIP_( int levelMgCoarse );
+  void buildRelaxationBlocksFLIP_( int levelMg );
+  void allocPressureChannelsFLIP_( int levelMgMax );
+  void computeDiagonalFLIP_( int levelMg );
+  void solvePressureFLIPPCG_( const FlipPressureSolveParams &params,
+                              int *outIters, float *outRelResidual );
 
   void sortBlockListMorton( std::vector<int>& blockList );
 

@@ -1007,8 +1007,40 @@ static void solvePressureHypreAMG(PressureSystem &sys, float tol, int maxIter)
 
 //=== Step 6: MSBG native V-cycle PCG solver ================================
 
-// MSBGチャンネルに圧力系を設定
-// Cell flags, divergence, face area, diagonal をセットアップ
+// Callback context for FLIP → MSBG pressure solver
+struct FlipPressureCtx {
+    SBG::SparseGrid<Vec3Float> *sgVel;
+    SBG::SparseGrid<float>     *sgMass;
+    SBG::SparseGrid<Vec3Float> *sgBeta;
+    float dt;
+    int nx, ny, nz;
+};
+
+static MSBG::CellFlags flipCellTypeCB(void *user, int x, int y, int z)
+{
+    auto *ctx = (FlipPressureCtx*)user;
+    if(x<0||y<0||z<0||x>=ctx->nx||y>=ctx->ny||z>=ctx->nz) return MSBG::CELL_SOLID;
+    return isFluid(ctx->sgMass, x, y, z) ? 0 : MSBG::CELL_VOID;
+}
+
+static float flipFaceCoeffCB(void *user, int dir, int x, int y, int z)
+{
+    auto *ctx = (FlipPressureCtx*)user;
+    return getVC(ctx->sgBeta, x, y, z, dir);
+}
+
+static float flipRhsCB(void *user, int x, int y, int z)
+{
+    auto *ctx = (FlipPressureCtx*)user;
+    if(!isFluid(ctx->sgMass, x, y, z)) return 0.f;
+    const float div =
+        getVC(ctx->sgVel,x+1,y,  z,  0)-getVC(ctx->sgVel,x,y,z,0)+
+        getVC(ctx->sgVel,x,  y+1,z,  1)-getVC(ctx->sgVel,x,y,z,1)+
+        getVC(ctx->sgVel,x,  y,  z+1,2)-getVC(ctx->sgVel,x,y,z,2);
+    return div / ctx->dt;
+}
+
+// 旧コード（互換性のため残す）
 static void buildMsbgPressureLevel0(
     MSBG::MultiresSparseGrid *msbg,
     SBG::SparseGrid<Vec3Float> *sgVel,
@@ -1311,9 +1343,20 @@ static void pressureProjection( MSBG::MultiresSparseGrid *msbg,
 
     if(gSolverKind == PressureSolverKind::MSBG_VCYCLE_PCG)
     {
-        // MSBG native solver: チャンネルに圧力系を設定 → V-cycle PCGで解く
-        buildMsbgPressureLevel0(msbg, sgVel, sgMass, sgBeta, dt);
-        solvePressureMsbgPCG(msbg, PCG_TOL, PCG_MAXITER);
+        // MSBG内部V-cycle PCG: callback経由でFLIPデータを注入
+        FlipPressureCtx ctx = { sgVel, sgMass, sgBeta, dt, nx, ny, nz };
+        MSBG::FlipPressureCallbacks cb;
+        cb.sampleCellType  = &flipCellTypeCB;
+        cb.sampleFaceCoeff = &flipFaceCoeffCB;
+        cb.sampleRhs       = &flipRhsCB;
+        cb.user = &ctx;
+
+        msbg->preparePressureSolveFLIP(cb);
+
+        MSBG::FlipPressureSolveParams sp;
+        sp.maxIter = PCG_MAXITER;
+        sp.tol     = PCG_TOL;
+        msbg->solvePressureFLIP(sp);
         // 結果は CH_PRESSURE に直接書かれている（sgP と同一）
     }
     else
