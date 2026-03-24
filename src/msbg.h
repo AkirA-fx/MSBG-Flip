@@ -836,11 +836,11 @@ struct FlipPressureCallbacks
 
 struct FlipPressureSolveParams
 {
-  int nPre         = 2;
-  int nPost        = 2;
+  int nPre         = 3;
+  int nPost        = 3;
   int nCoarse      = 24;
-  int maxIter      = 80;
-  float tol        = 1e-5f;
+  int maxIter      = 500;
+  float tol        = 5e-4f;
 };
 
 class MultiresSparseGrid

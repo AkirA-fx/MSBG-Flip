@@ -1357,8 +1357,6 @@ static void pressureProjection( MSBG::MultiresSparseGrid *msbg,
         msbg->preparePressureSolveFLIP(cb);
 
         MSBG::FlipPressureSolveParams sp;
-        sp.maxIter = PCG_MAXITER;
-        sp.tol     = PCG_TOL;
         msbg->solvePressureFLIP(sp);
         // 結果は CH_PRESSURE に直接書かれている（sgP と同一）
     }
