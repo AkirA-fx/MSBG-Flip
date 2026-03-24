@@ -22,6 +22,7 @@
 
 #include "msbg.h"
 #include "msbg_demo.h"
+#include "flip_sim.h"
 
 //#include <openvdb/openvdb.h>
 
@@ -35,7 +36,7 @@ static void showUsage( void )
   printf("\n");
   printf("usage: msbg_demo <options>\n" );
   printf("options:\n");
-  printf("  -c<n>  Test case (1=low-res bunny-of-bunnies, 2=high-res bunny-of-bunnies)\n");  
+  printf("  -c<n>  Test case (1=low-res bunny-of-bunnies, 2=high-res bunny-of-bunnies, 3=FLIP dam break)\n");  
   printf("  -r<n>  Effective volume resolution (default=1024)\n");
   printf("  -b<n>  MSBG base block resultion (n=16 or n=32, default=16)\n");
   printf("  -a<x,y,z,ax,ay,az,f>  Camera: position (x,y,z), look-at point (ax,ay,az) and focal-lentgh\n");
@@ -219,7 +220,13 @@ int main(int argc, char **argv)
 
   TRCP(("opcode=%d fname=%s %dx%dx%d\n",testCase,filename,sx,sy,sz)); 
 
-  const char *basePointsFile = testCase==2 ? 
+  if( testCase == 3 )
+  {
+    // Phase 2: FLIP ダムブレイクシミュレーション
+    return flip_dam_break( resolution, blockSize0, /*nSteps=*/20 );
+  }
+
+  const char *basePointsFile = testCase==2 ?
     				  "../data/bun_zipper.ply" :
 				  "../data/bun_zipper_res2.ply";
   msbg_test_sparse(testCase, basePointsFile, blockSize0, sx, sy, sz);

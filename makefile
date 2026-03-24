@@ -147,14 +147,15 @@ $(SHARED_LIB): $(OBJS_MSBG_LIB)
 # msbg_demo
 #
 
-OBJS_MSBG_DEMO = main.$(OBJE) msbg_demo.$(OBJE) 
+OBJS_MSBG_DEMO = main.$(OBJE) msbg_demo.$(OBJE) flip_sim.$(OBJE)
 
 LD_LIBS_FOR_MSBG_DEMO = \
+	    -lHYPRE -lmsmpi \
 	    -lpng \
 	    -ljpeg \
 	    -ltbbmalloc -ltbb -ltbbmalloc_proxy \
 	    -lz \
-	    -lm 
+	    -lm
 
 ifdef MIMP_ON_LINUX
 
