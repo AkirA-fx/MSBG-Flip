@@ -2630,12 +2630,8 @@ void MultiresSparseGrid::buildRelaxationBlocksFLIP_( int levelMg )
     BlockInfo *bi = getBlockInfo(bid, levelMg);
     if(!bi) continue;
     if(!(bi->flags & BLK_EXISTS)) continue;
-    if(bi->flags & (BLK_NO_FLUID | BLK_FIXED)) continue;
-    // Only include blocks at exactly this MG level — skip resolution
-    // transition blocks (level > levelMg) to avoid halo access into
-    // coarse-level blocks that lack proper data.
-    if(bi->level > levelMg) continue;
-    _blocksRelax[levelMg].push_back(bid);
+    if(isRelaxationBlock(levelMg, bi))
+      _blocksRelax[levelMg].push_back(bid);
   }
 }
 

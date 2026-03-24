@@ -206,10 +206,7 @@ static void buildRefinementMapFromParticles(
     const int nBlk=msbg->nBlocks();
     const int nLevels=msbg->getNumLevels();
     const int coarsest=nLevels-1;
-    // TODO: 適応グリッドはFC/CF halo問題修正後に有効化
-    // 現在は全blockをlevel 0（単一解像度）で動作させる
-    blockLevels.assign(nBlk, 0);
-    return;
+    blockLevels.assign(nBlk,coarsest);
 
     // BFS: 液体ブロックからのblock距離を計算
     const int INF=0x7fffffff;
