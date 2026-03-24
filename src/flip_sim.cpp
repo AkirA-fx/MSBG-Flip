@@ -32,7 +32,9 @@
 #include "HYPRE_krylov.h"
 
 static const float GRAVITY     = -9.8f;
-static const float DT          = 0.05f;
+static const float DT_MAX      = 0.05f;  // maximum time step
+static const float CFL_NUMBER  = 3.0f;   // CFL number (FLIP allows CFL>1)
+static const float DT_MIN      = 1e-3f;  // minimum time step
 static const int   PPV         = 8;
 static const float FLIP_ALPHA  = 0.95f;
 static const float MASS_EPS    = 1e-5f;
@@ -1534,7 +1536,7 @@ int flip_dam_break( int resolution, int blockSize, int nSteps )
 {
     using namespace MSBG;
     TRCP(("=== FLIP Dam Break (PF-FLIP, 2-phase) ===\n"));
-    TRCP(("resolution=%d blockSize=%d nSteps=%d dt=%.4f\n",resolution,blockSize,nSteps,DT));
+    TRCP(("resolution=%d blockSize=%d nSteps=%d dt_max=%.4f CFL=%.1f\n",resolution,blockSize,nSteps,DT_MAX,CFL_NUMBER));
     TRCP(("RHO_L=%.0f RHO_G=%.1f ratio=%.0f:1\n",RHO_L,RHO_G,RHO_L/RHO_G));
 
     const int sx=ALIGN(resolution,blockSize),sy=sx,sz=sx;
@@ -1644,25 +1646,37 @@ int flip_dam_break( int resolution, int blockSize, int nSteps )
             }
         }
 
+        // CFL adaptive time step
+        float maxVel=0.f;
+        for(const FlipParticle &p : gParticles)
+        {
+            float v2=p.vel.x*p.vel.x+p.vel.y*p.vel.y+p.vel.z*p.vel.z;
+            if(v2>maxVel) maxVel=v2;
+        }
+        maxVel=sqrtf(maxVel);
+        const float dt=(maxVel>1e-6f)
+            ? std::min(DT_MAX, std::max(DT_MIN, CFL_NUMBER/maxVel))
+            : DT_MAX;
+
         TIMER_START(&tm2);
         particleToGrid(    sgVel,sgMass,sgBeta);
         TIMER_STOP(&tm2); double t_p2g=TIMER_DIFF_MS(&tm2);
         TIMER_START(&tm2);
-        applyGravity(      sgVel,sgVelOld,sgMass,DT);
+        applyGravity(      sgVel,sgVelOld,sgMass,dt);
         TIMER_STOP(&tm2); double t_grav=TIMER_DIFF_MS(&tm2);
         TIMER_START(&tm2);
-        pressureProjection(msbg,sgVel,sgMass,sgDiv,sgP,sgR,sgZ,sgD,sgQ,sgBeta,DT);
+        pressureProjection(msbg,sgVel,sgMass,sgDiv,sgP,sgR,sgZ,sgD,sgQ,sgBeta,dt);
         TIMER_STOP(&tm2); double t_press=TIMER_DIFF_MS(&tm2);
         TIMER_START(&tm2);
         gridToParticle(    msbg,sgVel,sgVelOld);
         TIMER_STOP(&tm2); double t_g2p=TIMER_DIFF_MS(&tm2);
         TIMER_START(&tm2);
-        advectParticles(   sx,sy,sz,DT);
+        advectParticles(   sx,sy,sz,dt);
         TIMER_STOP(&tm2); double t_adv=TIMER_DIFF_MS(&tm2);
         TIMER_STOP(&tm);
-        TRCP(("step %3d/%d  particles=%d  activeBlocks=%d  %.3f sec\n",
+        TRCP(("step %3d/%d  particles=%d  activeBlocks=%d  %.3f sec  dt=%.4f maxVel=%.1f\n",
               step+1,nSteps,(int)gParticles.size(),(int)gActiveBlocks.size(),
-              (double)TIMER_DIFF_MS(&tm)/1000.0));
+              (double)TIMER_DIFF_MS(&tm)/1000.0, dt, maxVel));
         TRCP(("  P2G=%.1f Grav=%.1f Press=%.1f G2P=%.1f Adv=%.1f ms\n",
               t_p2g,t_grav,t_press,t_g2p,t_adv));
         saveParticleSlice(step,sx,sy,sz);
