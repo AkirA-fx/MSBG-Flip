@@ -2539,11 +2539,8 @@ void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
           int gx = bx*bsx + vx, gy = by*bsx + vy, gz = bz*bsx + vz;
           w[vid] = cb.sampleFaceCoeff(cb.user, dir, gx, gy, gz);
         }
-        // NOTE: BLK_CUTS_SOLID は設定しない。face area=beta を
-        // CH_FACE_AREA に格納しているが、processBlockLaplacian の
-        // face weight stencil はblock境界で+1アクセスするため、
-        // 独立確保されたFLIP blockでは範囲外読みでnanが出る。
-        // uniform weight (BLK_CUTS_SOLID なし) で動作させる。
+        // BLK_CUTS_SOLID は設定しない: processBlockLaplacianの
+        // face weight stencilはblock境界アクセスが安全でない
       }
     }
   }
@@ -2617,8 +2614,7 @@ void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
           d[i] = 0;
           continue;
         }
-        // Uniform weight stencil: diag = 6 (no BLK_CUTS_SOLID)
-        // D stores 1/diag for the relaxation kernel
+        // Uniform weight stencil (BLK_CUTS_SOLID not set)
         d[i] = (PSFloat)(1.f / 6.f);
       }
     }
