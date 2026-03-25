@@ -160,6 +160,87 @@ float interpComp( SBG::SparseGrid<Vec3Float> *sg,
     return sum;
 }
 
+// Pre-computed face support mask for fast advection interpolation.
+// Avoids per-corner isFluid() calls (48 mass lookups/particle → 24 byte loads).
+struct FaceSupportMask {
+    int nx=0, ny=0, nz=0;
+    std::vector<uint8_t> u, v, w;  // u: (nx+1)*ny*nz, v: nx*(ny+1)*nz, w: nx*ny*(nz+1)
+
+    void init(int sx, int sy, int sz) {
+        nx=sx; ny=sy; nz=sz;
+        u.assign((size_t)(nx+1)*ny*nz, 0);
+        v.assign((size_t)nx*(ny+1)*nz, 0);
+        w.assign((size_t)nx*ny*(nz+1), 0);
+    }
+    size_t idxU(int ix,int iy,int iz) const { return (size_t)ix+(size_t)(nx+1)*((size_t)iy+(size_t)ny*(size_t)iz); }
+    size_t idxV(int ix,int iy,int iz) const { return (size_t)ix+(size_t)nx*((size_t)iy+(size_t)(ny+1)*(size_t)iz); }
+    size_t idxW(int ix,int iy,int iz) const { return (size_t)ix+(size_t)nx*((size_t)iy+(size_t)ny*(size_t)iz); }
+
+    bool has(int comp,int ix,int iy,int iz) const {
+        if(comp==0) return (ix>=0&&ix<=nx&&iy>=0&&iy<ny&&iz>=0&&iz<nz) ? (u[idxU(ix,iy,iz)]!=0) : false;
+        if(comp==1) return (ix>=0&&ix<nx&&iy>=0&&iy<=ny&&iz>=0&&iz<nz) ? (v[idxV(ix,iy,iz)]!=0) : false;
+        return (ix>=0&&ix<nx&&iy>=0&&iy<ny&&iz>=0&&iz<=nz) ? (w[idxW(ix,iy,iz)]!=0) : false;
+    }
+};
+
+FaceSupportMask buildFaceSupportMask(SBG::SparseGrid<float> *sgMass, float massEps)
+{
+    FaceSupportMask mask;
+    const int nx=sgMass->sx(), ny=sgMass->sy(), nz=sgMass->sz();
+    mask.init(nx, ny, nz);
+    tbb::parallel_for(0, nz, [&](int iz){
+        for(int iy=0;iy<ny;iy++) for(int ix=0;ix<=nx;ix++) {
+            bool fL=(ix>0)&&isFluid(sgMass,ix-1,iy,iz,massEps);
+            bool fR=(ix<nx)&&isFluid(sgMass,ix,iy,iz,massEps);
+            mask.u[mask.idxU(ix,iy,iz)]=(uint8_t)(fL||fR);
+        }
+    });
+    tbb::parallel_for(0, nz, [&](int iz){
+        for(int iy=0;iy<=ny;iy++) for(int ix=0;ix<nx;ix++) {
+            bool fB=(iy>0)&&isFluid(sgMass,ix,iy-1,iz,massEps);
+            bool fT=(iy<ny)&&isFluid(sgMass,ix,iy,iz,massEps);
+            mask.v[mask.idxV(ix,iy,iz)]=(uint8_t)(fB||fT);
+        }
+    });
+    tbb::parallel_for(0, nz+1, [&](int iz){
+        for(int iy=0;iy<ny;iy++) for(int ix=0;ix<nx;ix++) {
+            bool fN=(iz>0)&&isFluid(sgMass,ix,iy,iz-1,massEps);
+            bool fF=(iz<nz)&&isFluid(sgMass,ix,iy,iz,massEps);
+            mask.w[mask.idxW(ix,iy,iz)]=(uint8_t)(fN||fF);
+        }
+    });
+    return mask;
+}
+
+// Fast valid-weight interpolation using pre-computed face support mask.
+float interpCompValidFineMasked( SBG::SparseGrid<Vec3Float> *sgVel,
+                                 const FaceSupportMask &support,
+                                 float px,float py,float pz,
+                                 float ox,float oy,float oz,int comp,
+                                 float *validWeightOut )
+{
+    const float gx=px-ox,gy=py-oy,gz=pz-oz;
+    const int ix0=(int)floorf(gx),iy0=(int)floorf(gy),iz0=(int)floorf(gz);
+    const float fx=gx-ix0,fy=gy-iy0,fz=gz-iz0;
+
+    float sum=0.f, wsum=0.f;
+    for(int dz=0;dz<=1;dz++) for(int dy=0;dy<=1;dy++) for(int dx=0;dx<=1;dx++)
+    {
+        const float w=(dx?fx:1.f-fx)*(dy?fy:1.f-fy)*(dz?fz:1.f-fz);
+        const int ix=ix0+dx, iy=iy0+dy, iz=iz0+dz;
+        if(!support.has(comp,ix,iy,iz)) continue;
+        int bid,vid;
+        if(!getBidVidV(sgVel,ix,iy,iz,bid,vid)) continue;
+        Vec3Float *d=sgVel->getBlockDataPtr(bid);
+        if(!d) continue;
+        float val=(comp==0)?d[vid].x:((comp==1)?d[vid].y:d[vid].z);
+        sum  += w*val;
+        wsum += w;
+    }
+    if(validWeightOut) *validWeightOut = wsum;
+    return (wsum>1e-6f) ? (sum/wsum) : 0.f;
+}
+
 // Valid-weight trilinear interpolation for advection RK2.
 // Returns interpolated velocity at (px,py,pz) using only grid points
 // that have block data allocated AND fluid support in sgMass.
@@ -1474,6 +1555,9 @@ void FlipSimulation::advectParticles(float dt)
     const float eps=1e-4f,xMax=(float)sx-eps,yMax=(float)sy-eps,zMax=(float)sz-eps;
     const size_t np=state_.particles.size();
 
+    // Pre-compute face support mask (replaces per-corner isFluid() calls)
+    const FaceSupportMask supportMask = buildFaceSupportMask(sgMass, MASS_EPS);
+
     tbb::parallel_for(tbb::blocked_range<size_t>(0,np),
         [&](const tbb::blocked_range<size_t> &range){
         for(size_t i=range.begin();i<range.end();i++)
@@ -1490,19 +1574,18 @@ void FlipSimulation::advectParticles(float dt)
 
             // RK2 Midpoint: k1 = particle velocity (already pressure-projected
             // via G2P), k2 = grid velocity at midpoint with valid-weight fallback.
-            // k1 uses p.vel directly (avoids sparse grid empty-block issues).
             const Vec3Float k1 = p.vel;
             const Vec3Float mid(
                 std::clamp(p.pos.x + 0.5f*dt*k1.x, 0.f, xMax),
                 std::clamp(p.pos.y + 0.5f*dt*k1.y, 0.f, yMax),
                 std::clamp(p.pos.z + 0.5f*dt*k1.z, 0.f, zMax));
 
-            // Sample grid velocity at midpoint; fall back to k1 where no data
+            // Sample grid velocity at midpoint using pre-computed face support mask
             float wu=0.f,wv=0.f,ww=0.f;
             Vec3Float k2(
-                interpCompValidFine(sgVel,sgMass,mid.x,mid.y,mid.z,0.f,0.5f,0.5f,0,MASS_EPS,&wu),
-                interpCompValidFine(sgVel,sgMass,mid.x,mid.y,mid.z,0.5f,0.f,0.5f,1,MASS_EPS,&wv),
-                interpCompValidFine(sgVel,sgMass,mid.x,mid.y,mid.z,0.5f,0.5f,0.f,2,MASS_EPS,&ww));
+                interpCompValidFineMasked(sgVel,supportMask,mid.x,mid.y,mid.z,0.f,0.5f,0.5f,0,&wu),
+                interpCompValidFineMasked(sgVel,supportMask,mid.x,mid.y,mid.z,0.5f,0.f,0.5f,1,&wv),
+                interpCompValidFineMasked(sgVel,supportMask,mid.x,mid.y,mid.z,0.5f,0.5f,0.f,2,&ww));
             if(wu<0.01f) k2.x=k1.x;
             if(wv<0.01f) k2.y=k1.y;
             if(ww<0.01f) k2.z=k1.z;
