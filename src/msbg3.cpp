@@ -2478,6 +2478,7 @@ void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
     auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
     if(!sgF) continue;
     sgF->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+    const int bsx = sgF->bsx();
 
     for(LongInt bidL = 0; bidL < sgF->nBlocks(); bidL++)
     {
@@ -2488,16 +2489,16 @@ void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
       CellFlags *dst = sgF->getBlockDataPtr(bid, 1, 0);
       if(!dst) continue;
 
-      bool hasLiquid = false;
-      for(int vid = 0; vid < sgF->nVoxelsInBlock(); vid++)
-      {
-        int bx,by,bz;
-        _sg0->getBlockCoordsById(bid, bx, by, bz);
-        const int bsx = sgF->bsx();
-        int vx = vid % bsx, vy = (vid / bsx) % bsx, vz = vid / (bsx*bsx);
-        int gx = bx*bsx + vx, gy = by*bsx + vy, gz = bz*bsx + vz;
+      int bx,by,bz;
+      _sg0->getBlockCoordsById(bid, bx, by, bz);
+      const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
 
-        CellFlags fl = cb.sampleCellType(cb.user, gx, gy, gz);
+      bool hasLiquid = false;
+      for(int vz=0, vid=0; vz<bsx; ++vz)
+      for(int vy=0; vy<bsx; ++vy)
+      for(int vx=0; vx<bsx; ++vx, ++vid)
+      {
+        CellFlags fl = cb.sampleCellType(cb.user, gx0+vx, gy0+vy, gz0+vz);
         fl &= (CELL_SOLID | CELL_VOID | CELL_FIXED);
         dst[vid] = fl;
 
@@ -2519,6 +2520,7 @@ void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
       auto *sgW = getFaceAreaChannel(dir, level, levelMg);
       if(!sgW) continue;
       sgW->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+      const int bsx = sgW->bsx();
 
       for(LongInt bidL = 0; bidL < sgW->nBlocks(); bidL++)
       {
@@ -2531,16 +2533,14 @@ void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
 
         int bx,by,bz;
         _sg0->getBlockCoordsById(bid, bx, by, bz);
-        const int bsx = sgW->bsx();
+        const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
 
-        for(int vid = 0; vid < sgW->nVoxelsInBlock(); vid++)
+        for(int vz=0, vid=0; vz<bsx; ++vz)
+        for(int vy=0; vy<bsx; ++vy)
+        for(int vx=0; vx<bsx; ++vx, ++vid)
         {
-          int vx = vid % bsx, vy = (vid / bsx) % bsx, vz = vid / (bsx*bsx);
-          int gx = bx*bsx + vx, gy = by*bsx + vy, gz = bz*bsx + vz;
-          w[vid] = cb.sampleFaceCoeff(cb.user, dir, gx, gy, gz);
+          w[vid] = cb.sampleFaceCoeff(cb.user, dir, gx0+vx, gy0+vy, gz0+vz);
         }
-        // BLK_CUTS_SOLID は設定しない: processBlockLaplacianの
-        // face weight stencilはblock境界アクセスが安全でない
       }
     }
   }
@@ -2551,6 +2551,8 @@ void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
     if(sgRhs)
     {
       sgRhs->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+      const int bsx = sgRhs->bsx();
+
       for(LongInt bidL = 0; bidL < sgRhs->nBlocks(); bidL++)
       {
         const int bid = (int)bidL;
@@ -2562,12 +2564,13 @@ void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
 
         int bx,by,bz;
         _sg0->getBlockCoordsById(bid, bx, by, bz);
-        const int bsx = sgRhs->bsx();
+        const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
 
-        for(int vid = 0; vid < sgRhs->nVoxelsInBlock(); vid++)
+        for(int vz=0, vid=0; vz<bsx; ++vz)
+        for(int vy=0; vy<bsx; ++vy)
+        for(int vx=0; vx<bsx; ++vx, ++vid)
         {
-          int vx = vid % bsx, vy = (vid / bsx) % bsx, vz = vid / (bsx*bsx);
-          r[vid] = cb.sampleRhs(cb.user, bx*bsx+vx, by*bsx+vy, bz*bsx+vz);
+          r[vid] = cb.sampleRhs(cb.user, gx0+vx, gy0+vy, gz0+vz);
         }
       }
     }
@@ -2584,13 +2587,14 @@ void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
   {
     auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
     auto *sgD = getPSFloatChannel(CH_DIAGONAL, level, levelMg);
+    auto *sgFU = getFaceAreaChannel(0, level, levelMg);
+    auto *sgFV = getFaceAreaChannel(1, level, levelMg);
+    auto *sgFW = getFaceAreaChannel(2, level, levelMg);
     if(!sgF || !sgD) continue;
 
     sgD->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
 
-    // Uniform weight stencil: D = 1/6
-    // processBlockLaplacian internally handles grid spacing (h) scaling
-    const PSFloat diagVal = (PSFloat)(1.f / 6.f);
+    const bool hasFaceArea = (sgFU && sgFV && sgFW);
 
     for(int bid = 0; bid < _nBlocks; bid++)
     {
@@ -2602,15 +2606,58 @@ void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
       PSFloat   *d = sgD->getBlockDataPtr(bid, 1, 0);
       if(!f || !d) continue;
 
-      for(int i = 0; i < sgF->nVoxelsInBlock(); i++)
+      int bx,by,bz;
+      _sg0->getBlockCoordsById(bid, bx, by, bz);
+      const int bsx = sgF->bsx();
+      const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
+
+      // Clear stale flags before re-evaluation
+      bi->flags &= ~BLK_CUTS_SOLID;
+      bool blockHasVariableCoeff = false;
+      const float eps = 1e-4f;
+
+      for(int vz=0, vid=0; vz<bsx; ++vz)
+      for(int vy=0; vy<bsx; ++vy)
+      for(int vx=0; vx<bsx; ++vx, ++vid)
       {
-        if(f[i] & (CELL_SOLID | CELL_VOID | CELL_FIXED))
+        // Clear stale CELL_PARTIAL_SOLID before re-evaluation
+        f[vid] &= ~CELL_PARTIAL_SOLID;
+
+        if(f[vid] & (CELL_SOLID | CELL_VOID | CELL_FIXED))
         {
-          d[i] = 0;
+          d[vid] = 0;
           continue;
         }
-        d[i] = diagVal;
+
+        if(!hasFaceArea)
+        {
+          d[vid] = (PSFloat)(1.f / 6.f);
+          continue;
+        }
+
+        const int gx=gx0+vx, gy=gy0+vy, gz=gz0+vz;
+        // 6 face coefficients surrounding this cell
+        const float wXm = sgFU->getValueGen_(gx,   gy, gz);  // x-left
+        const float wXp = sgFU->getValueGen_(gx+1, gy, gz);  // x-right
+        const float wYm = sgFV->getValueGen_(gx, gy,   gz);  // y-bottom
+        const float wYp = sgFV->getValueGen_(gx, gy+1, gz);  // y-top
+        const float wZm = sgFW->getValueGen_(gx, gy, gz);    // z-back
+        const float wZp = sgFW->getValueGen_(gx, gy, gz+1);  // z-front
+
+        const float sum = wXm + wXp + wYm + wYp + wZm + wZp;
+        d[vid] = (sum > 1e-12f) ? (PSFloat)(1.f / sum) : (PSFloat)0;
+
+        // Mark variable face coefficients for processBlockLaplacian
+        if(fabsf(wXm-1.f)>eps || fabsf(wXp-1.f)>eps ||
+           fabsf(wYm-1.f)>eps || fabsf(wYp-1.f)>eps ||
+           fabsf(wZm-1.f)>eps || fabsf(wZp-1.f)>eps)
+        {
+          f[vid] |= CELL_PARTIAL_SOLID;
+          blockHasVariableCoeff = true;
+        }
       }
+
+      if(blockHasVariableCoeff) bi->flags |= BLK_CUTS_SOLID;
     }
   }
 }
@@ -2632,56 +2679,125 @@ void MultiresSparseGrid::buildRelaxationBlocksFLIP_( int levelMg )
 /*-------------------------------------------------------------------------*/
 void MultiresSparseGrid::restrictPressureMetaFLIP_( int levelMgCoarse )
 {
+  const int levelMgFine = levelMgCoarse - 1;
 
-  // CH_FACE_AREA is a 3-dir special channel — cannot use generic
-  // downsampleChannel(). Instead, fill coarse face area with 1.0
-  // and set cell flags to fluid (0) for all coarse blocks.
-
-  // 1. cell flags: set all coarse cells to fluid (=0)
+  // 1. cell flags: restrict from fine level
+  //    fluid-priority: if any child cell is fluid, coarse cell is fluid
   for(int level = 0; level < _nLevels; level++)
   {
-    auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, levelMgCoarse);
-    if(!sgF) continue;
-    sgF->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
-    for(LongInt bidL = 0; bidL < sgF->nBlocks(); bidL++)
+    auto *sgFCoarse = getFlagsChannel(CH_CELL_FLAGS, level, levelMgCoarse);
+    auto *sgFFine   = getFlagsChannel(CH_CELL_FLAGS, level, levelMgFine);
+    if(!sgFCoarse) continue;
+    sgFCoarse->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+
+    for(LongInt bidL = 0; bidL < sgFCoarse->nBlocks(); bidL++)
     {
       const int bid = (int)bidL;
       BlockInfo *bi = getBlockInfo(bid, levelMgCoarse);
       if(!bi || bi->level != level) continue;
 
-      CellFlags *f = sgF->getBlockDataPtr(bid, 1, 1); // alloc+zero
-      if(!f) continue;
-      // all zeros = fluid (!(CELL_SOLID|CELL_VOID))
+      CellFlags *dst = sgFCoarse->getBlockDataPtr(bid, 1, 1); // alloc+zero
+      if(!dst) continue;
+
+      if(sgFFine)
+      {
+        int bx,by,bz;
+        _sg0->getBlockCoordsById(bid, bx, by, bz);
+        const int bsx = sgFCoarse->bsx();
+        const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
+
+        for(int vz=0, vid=0; vz<bsx; ++vz)
+        for(int vy=0; vy<bsx; ++vy)
+        for(int vx=0; vx<bsx; ++vx, ++vid)
+        {
+          // Sample 8 children from fine level (2x resolution mapping)
+          const int fgx = (gx0+vx)*2, fgy = (gy0+vy)*2, fgz = (gz0+vz)*2;
+          bool hasFluid=false, hasSolid=false, hasVoid=false;
+          for(int dz=0;dz<2;dz++)
+          for(int dy=0;dy<2;dy++)
+          for(int dx=0;dx<2;dx++)
+          {
+            CellFlags cf = sgFFine->getValueGen_(fgx+dx, fgy+dy, fgz+dz);
+            if(!(cf & (CELL_SOLID|CELL_VOID|CELL_FIXED))) hasFluid=true;
+            if(cf & CELL_SOLID) hasSolid=true;
+            if(cf & CELL_VOID)  hasVoid=true;
+          }
+          // Fluid priority for coarse solver
+          if(hasFluid) dst[vid] = 0;
+          else if(hasSolid) dst[vid] = CELL_SOLID;
+          else dst[vid] = CELL_VOID;
+        }
+      }
+      // else: fine not available, default to fluid (zero)
+
+      // Update block flags
+      bool blockHasFluid = false;
+      const int nvox = sgFCoarse->nVoxelsInBlock();
+      for(int i=0;i<nvox;i++)
+        if(!(dst[i] & (CELL_SOLID|CELL_VOID|CELL_FIXED))) { blockHasFluid=true; break; }
 
       bi->flags |= BLK_EXISTS;
-      bi->flags &= ~(BLK_NO_FLUID | BLK_FIXED);
+      if(blockHasFluid) bi->flags &= ~BLK_NO_FLUID;
+      else              bi->flags |=  BLK_NO_FLUID;
+      bi->flags &= ~BLK_FIXED;
     }
   }
 
-  // 2. face area: fill 1.0 for all 3 directions
+  // 2. face area: restrict from fine level via averaging
   for(int dir = 0; dir < 3; dir++)
   {
     for(int level = 0; level < _nLevels; level++)
     {
-      auto *sgW = getFaceAreaChannel(dir, level, levelMgCoarse);
-      if(!sgW) continue;
-      sgW->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
-      for(LongInt bidL = 0; bidL < sgW->nBlocks(); bidL++)
+      auto *sgWCoarse = getFaceAreaChannel(dir, level, levelMgCoarse);
+      auto *sgWFine   = getFaceAreaChannel(dir, level, levelMgFine);
+      if(!sgWCoarse) continue;
+      sgWCoarse->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+
+      for(LongInt bidL = 0; bidL < sgWCoarse->nBlocks(); bidL++)
       {
         const int bid = (int)bidL;
         BlockInfo *bi = getBlockInfo(bid, levelMgCoarse);
         if(!bi || bi->level != level) continue;
 
-        float *w = sgW->getBlockDataPtr(bid, 1, 0);
+        float *w = sgWCoarse->getBlockDataPtr(bid, 1, 0);
         if(!w) continue;
-        for(int i = 0; i < sgW->nVoxelsInBlock(); i++) w[i] = 1.0f;
 
-        // BLK_CUTS_SOLID は設定しない (uniform weight)
+        if(sgWFine)
+        {
+          int bx,by,bz;
+          _sg0->getBlockCoordsById(bid, bx, by, bz);
+          const int bsx = sgWCoarse->bsx();
+          const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
+
+          for(int vz=0, vid=0; vz<bsx; ++vz)
+          for(int vy=0; vy<bsx; ++vy)
+          for(int vx=0; vx<bsx; ++vx, ++vid)
+          {
+            // Average 4 fine faces (tangential 2x2 sampling)
+            const int fgx = (gx0+vx)*2, fgy = (gy0+vy)*2, fgz = (gz0+vz)*2;
+            float sum = 0.f;
+            for(int j=0;j<2;j++)
+            for(int k=0;k<2;k++)
+            {
+              int fx=fgx, fy=fgy, fz=fgz;
+              if(dir==0) { fy+=j; fz+=k; }
+              if(dir==1) { fx+=j; fz+=k; }
+              if(dir==2) { fx+=j; fy+=k; }
+              sum += sgWFine->getValueGen_(fx, fy, fz);
+            }
+            w[vid] = sum * 0.25f;
+          }
+        }
+        else
+        {
+          // No fine data: default to 1.0
+          for(int i=0; i<sgWCoarse->nVoxelsInBlock(); i++) w[i]=1.0f;
+        }
       }
     }
   }
 
-  // 3. diagonal: recompute from coarse face weights
+  // 3. diagonal: recompute from coarse face weights (+ set CELL_PARTIAL_SOLID/BLK_CUTS_SOLID)
   computeDiagonalFLIP_(levelMgCoarse);
 
   // 4. block lists

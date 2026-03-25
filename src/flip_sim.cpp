@@ -20,6 +20,7 @@
 #include <vector>
 #include <algorithm>
 #include <queue>
+#include <unordered_map>
 #include <tbb/tbb.h>
 #include "msbg.h"
 #include "bitmap.h"
@@ -297,13 +298,9 @@ static void particleToGrid( SBG::SparseGrid<Vec3Float> *sgVel,
 {
     zeroVecChannel(sgVel); zeroFloatChannel(sgMass); zeroVecChannel(sgBeta);
     const int nvox=sgVel->nVoxelsInBlock();
-    const int nElem=sgVel->nBlocks()*nvox;
-    std::vector<float> wU(nElem,0.f),wV(nElem,0.f),wW(nElem,0.f);
-    std::vector<float> rhoU(nElem,0.f),rhoV(nElem,0.f),rhoW(nElem,0.f);
-    std::vector<int>   cellLiqCnt(nElem,0);
 
-    // スレッドローカル散布バッファ
-    struct P2GBuf {
+    // ブロック単位のスレッドローカル散布バッファ（メモリ効率改善）
+    struct P2GBlockBuf {
         std::vector<float> vx,vy,vz,mass,wu,wv,ww,ru,rv,rw;
         std::vector<int>   liq;
         void init(int n){
@@ -314,9 +311,18 @@ static void particleToGrid( SBG::SparseGrid<Vec3Float> *sgVel,
             liq.assign(n,0);
         }
     };
+    struct P2GBuf {
+        std::unordered_map<int, P2GBlockBuf> blocks;
+        P2GBlockBuf &getBlock(int bid, int nv) {
+            auto it = blocks.find(bid);
+            if(it != blocks.end()) return it->second;
+            P2GBlockBuf buf; buf.init(nv);
+            auto res = blocks.emplace(bid, std::move(buf));
+            return res.first->second;
+        }
+    };
 
-    tbb::enumerable_thread_specific<P2GBuf> tlsBuf(
-        [&](){ P2GBuf b; b.init(nElem); return b; });
+    tbb::enumerable_thread_specific<P2GBuf> tlsBuf([&](){ return P2GBuf(); });
 
     const size_t np=gParticles.size();
     const int bl=sgVel->bsxLog2(), bm=sgVel->bsx()-1;
@@ -345,8 +351,9 @@ static void particleToGrid( SBG::SparseGrid<Vec3Float> *sgVel,
             // cell mass
             { int bid,vid;
               if(bv((int)floorf(p.pos.x),(int)floorf(p.pos.y),(int)floorf(p.pos.z),bid,vid))
-              { int idx=bid*nvox+vid; L.mass[idx]+=1.f;
-                if(p.phase==0) L.liq[idx]++; } }
+              { P2GBlockBuf &B=L.getBlock(bid,nvox);
+                B.mass[vid]+=1.f;
+                if(p.phase==0) B.liq[vid]++; } }
 
             // U face (0, 0.5, 0.5)
             { float gx=p.pos.x,gy=p.pos.y-0.5f,gz=p.pos.z-0.5f;
@@ -356,8 +363,8 @@ static void particleToGrid( SBG::SparseGrid<Vec3Float> *sgVel,
               { float w=(dx?fx:1.f-fx)*(dy?fy:1.f-fy)*(dz?fz:1.f-fz);
                 int bid,vid;
                 if(bv(ix0+dx,iy0+dy,iz0+dz,bid,vid))
-                { int idx=bid*nvox+vid;
-                  L.vx[idx]+=p.vel.x*w; L.wu[idx]+=w; L.ru[idx]+=mp*w; } } }
+                { P2GBlockBuf &B=L.getBlock(bid,nvox);
+                  B.vx[vid]+=p.vel.x*w; B.wu[vid]+=w; B.ru[vid]+=mp*w; } } }
 
             // V face (0.5, 0, 0.5)
             { float gx=p.pos.x-0.5f,gy=p.pos.y,gz=p.pos.z-0.5f;
@@ -367,8 +374,8 @@ static void particleToGrid( SBG::SparseGrid<Vec3Float> *sgVel,
               { float w=(dx?fx:1.f-fx)*(dy?fy:1.f-fy)*(dz?fz:1.f-fz);
                 int bid,vid;
                 if(bv(ix0+dx,iy0+dy,iz0+dz,bid,vid))
-                { int idx=bid*nvox+vid;
-                  L.vy[idx]+=p.vel.y*w; L.wv[idx]+=w; L.rv[idx]+=mp*w; } } }
+                { P2GBlockBuf &B=L.getBlock(bid,nvox);
+                  B.vy[vid]+=p.vel.y*w; B.wv[vid]+=w; B.rv[vid]+=mp*w; } } }
 
             // W face (0.5, 0.5, 0)
             { float gx=p.pos.x-0.5f,gy=p.pos.y-0.5f,gz=p.pos.z;
@@ -378,37 +385,57 @@ static void particleToGrid( SBG::SparseGrid<Vec3Float> *sgVel,
               { float w=(dx?fx:1.f-fx)*(dy?fy:1.f-fy)*(dz?fz:1.f-fz);
                 int bid,vid;
                 if(bv(ix0+dx,iy0+dy,iz0+dz,bid,vid))
-                { int idx=bid*nvox+vid;
-                  L.vz[idx]+=p.vel.z*w; L.ww[idx]+=w; L.rw[idx]+=mp*w; } } }
+                { P2GBlockBuf &B=L.getBlock(bid,nvox);
+                  B.vz[vid]+=p.vel.z*w; B.ww[vid]+=w; B.rw[vid]+=mp*w; } } }
         }
     });
 
-    // スレッドバッファ合算 → グリッドチャンネル + 重み配列
+    // スレッドバッファ合算（ブロック単位）
+    struct P2GMergedBlock {
+        std::vector<float> vx,vy,vz,mass,wu,wv,ww,ru,rv,rw;
+        std::vector<int>   liq;
+        void init(int n){
+            vx.assign(n,0.f); vy.assign(n,0.f); vz.assign(n,0.f);
+            mass.assign(n,0.f);
+            wu.assign(n,0.f); wv.assign(n,0.f); ww.assign(n,0.f);
+            ru.assign(n,0.f); rv.assign(n,0.f); rw.assign(n,0.f);
+            liq.assign(n,0);
+        }
+    };
+    std::unordered_map<int, P2GMergedBlock> merged;
     for(auto &L:tlsBuf)
     {
-        for(int i=0;i<nElem;i++)
+        for(auto &kv : L.blocks)
         {
-            wU[i]+=L.wu[i]; wV[i]+=L.wv[i]; wW[i]+=L.ww[i];
-            rhoU[i]+=L.ru[i]; rhoV[i]+=L.rv[i]; rhoW[i]+=L.rw[i];
-            cellLiqCnt[i]+=L.liq[i];
+            const int bid=kv.first;
+            const P2GBlockBuf &src=kv.second;
+            P2GMergedBlock &dst=merged[bid];
+            if(dst.vx.empty()) dst.init(nvox);
+            for(int vid=0;vid<nvox;vid++)
+            {
+                dst.vx[vid]+=src.vx[vid]; dst.vy[vid]+=src.vy[vid]; dst.vz[vid]+=src.vz[vid];
+                dst.mass[vid]+=src.mass[vid];
+                dst.wu[vid]+=src.wu[vid]; dst.wv[vid]+=src.wv[vid]; dst.ww[vid]+=src.ww[vid];
+                dst.ru[vid]+=src.ru[vid]; dst.rv[vid]+=src.rv[vid]; dst.rw[vid]+=src.rw[vid];
+                dst.liq[vid]+=src.liq[vid];
+            }
         }
     }
+
     // 速度・質量をグリッドに書き出し
-    for(int bid=0;bid<sgVel->nBlocks();bid++)
+    for(auto &kv : merged)
     {
+        const int bid=kv.first;
+        const P2GMergedBlock &B=kv.second;
         Vec3Float *vd=sgVel->getBlockDataPtr(bid);
         float     *md=sgMass->getBlockDataPtr(bid);
         if(!vd) continue;
-        const int off=bid*nvox;
-        for(auto &L:tlsBuf)
+        for(int vid=0;vid<nvox;vid++)
         {
-            for(int vid=0;vid<nvox;vid++)
-            {
-                vd[vid].x+=L.vx[off+vid];
-                vd[vid].y+=L.vy[off+vid];
-                vd[vid].z+=L.vz[off+vid];
-                if(md) md[vid]+=L.mass[off+vid];
-            }
+            vd[vid].x+=B.vx[vid];
+            vd[vid].y+=B.vy[vid];
+            vd[vid].z+=B.vz[vid];
+            if(md) md[vid]+=B.mass[vid];
         }
     }
 
@@ -421,26 +448,32 @@ static void particleToGrid( SBG::SparseGrid<Vec3Float> *sgVel,
 
     // normalize velocity + compute beta + active blocks
     gActiveBlocks.clear();
-    const int nx=sgMass->sx(),ny=sgMass->sy(),nz=sgMass->sz();
     for(int bid=0;bid<sgVel->nBlocks();bid++)
     {
         Vec3Float *vd=sgVel->getBlockDataPtr(bid);
         Vec3Float *bd=sgBeta->getBlockDataPtr(bid);
         float     *md=sgMass->getBlockDataPtr(bid);
         if(!vd) continue;
-        const int off=bid*nvox; bool hasFluid=false;
+        bool hasFluid=false;
+
+        // このブロックのマージ済みデータを取得（なければスキップ）
+        auto mit=merged.find(bid);
+        const bool hasMerged=(mit!=merged.end());
 
         // block の x0,y0,z0 を計算
         const int nbx=sgMass->nbx(),nby=sgMass->nby(),bs=sgMass->bsx();
-        const int bx=bid%nbx, by=(bid/nbx)%nby, bz=bid/(nbx*nby);
-        const int x0=bx*bs, y0=by*bs, z0=bz*bs;
+        const int bxB=bid%nbx, byB=(bid/nbx)%nby, bzB=bid/(nbx*nby);
+        const int x0=bxB*bs, y0=byB*bs, z0=bzB*bs;
 
         for(int vid=0;vid<nvox;vid++)
         {
             // 速度正規化
-            if(wU[off+vid]>MASS_EPS) vd[vid].x/=wU[off+vid]; else vd[vid].x=0.f;
-            if(wV[off+vid]>MASS_EPS) vd[vid].y/=wV[off+vid]; else vd[vid].y=0.f;
-            if(wW[off+vid]>MASS_EPS) vd[vid].z/=wW[off+vid]; else vd[vid].z=0.f;
+            const float wuV=hasMerged?mit->second.wu[vid]:0.f;
+            const float wvV=hasMerged?mit->second.wv[vid]:0.f;
+            const float wwV=hasMerged?mit->second.ww[vid]:0.f;
+            if(wuV>MASS_EPS) vd[vid].x/=wuV; else vd[vid].x=0.f;
+            if(wvV>MASS_EPS) vd[vid].y/=wvV; else vd[vid].y=0.f;
+            if(wwV>MASS_EPS) vd[vid].z/=wwV; else vd[vid].z=0.f;
             if(md&&md[vid]>MASS_EPS) hasFluid=true;
 
             // phi → beta 計算 (各フェース独立)
@@ -459,9 +492,12 @@ static void particleToGrid( SBG::SparseGrid<Vec3Float> *sgVel,
                     return std::max(1.f/rho, BETA_MIN);
                 };
 
-                float phiU=phiFromRho(rhoU[off+vid]);
-                float phiV=phiFromRho(rhoV[off+vid]);
-                float phiW=phiFromRho(rhoW[off+vid]);
+                const float ruV=hasMerged?mit->second.ru[vid]:0.f;
+                const float rvV=hasMerged?mit->second.rv[vid]:0.f;
+                const float rwV=hasMerged?mit->second.rw[vid]:0.f;
+                float phiU=phiFromRho(ruV);
+                float phiV=phiFromRho(rvV);
+                float phiW=phiFromRho(rwV);
 
                 // セル相判定: 0=liquid, 1=air, -1=empty/外
                 auto cellPh=[&](int cx,int cy,int cz)->int{
@@ -469,7 +505,9 @@ static void particleToGrid( SBG::SparseGrid<Vec3Float> *sgVel,
                     if(!getBidVidF(sgMass,cx,cy,cz,b2,v2)) return -1;
                     float *md2=sgMass->getBlockDataPtr(b2);
                     if(!md2||md2[v2]<=MASS_EPS) return -1;
-                    return (cellLiqCnt[b2*nvox+v2]*2>(int)(md2[v2]+0.5f))?0:1;
+                    auto mit2=merged.find(b2);
+                    if(mit2==merged.end()) return -1;
+                    return (mit2->second.liq[v2]*2>(int)(md2[v2]+0.5f))?0:1;
                 };
 
                 // 界面クランプ (論文§3.3):
@@ -1439,19 +1477,20 @@ static float interpCompMSBG( MSBG::MultiresSparseGrid *msbg,
     const int ix0=(int)floorf(gx),iy0=(int)floorf(gy),iz0=(int)floorf(gz);
     const float fx=gx-ix0,fy=gy-iy0,fz=gz-iz0;
 
-    // 中心voxelのblock levelを取得
     const int nx=sg->sx(), ny=sg->sy(), nz=sg->sz();
+
+    // 中心voxelのblock levelを取得
     const int cx=std::max(0,std::min(ix0,nx-1));
     const int cy=std::max(0,std::min(iy0,ny-1));
     const int cz=std::max(0,std::min(iz0,nz-1));
-    int bx,by,bz;
-    sg->getBlockCoords(cx,cy,cz,bx,by,bz);
-    const int bid=sg->getBlockIndex(bx,by,bz);
-    const int level=msbg->getBlockLevel(bid);
+    int bxC,byC,bzC;
+    sg->getBlockCoords(cx,cy,cz,bxC,byC,bzC);
+    const int bidC=sg->getBlockIndex(bxC,byC,bzC);
+    const int level=msbg->getBlockLevel(bidC);
 
     if(level==0)
     {
-        // Fast path: level 0 — use original SG directly
+        // Fast path: level 0 — fine-grid trilinear
         float sum=0.f;
         for(int dz=0;dz<=1;dz++) for(int dy=0;dy<=1;dy++) for(int dx=0;dx<=1;dx++)
             sum+=(dx?fx:1.f-fx)*(dy?fy:1.f-fy)*(dz?fz:1.f-fz)
@@ -1459,14 +1498,12 @@ static float interpCompMSBG( MSBG::MultiresSparseGrid *msbg,
         return sum;
     }
 
-    // Coarse level: read from level-specific SparseGrid
-    // Coordinates are scaled down by (1<<level)
-    const int shift=level;
+    // Coarse level: trilinear in coarse-space coordinates
     auto *sgLev=msbg->getVecChannel(chanId,level,0);
-    if(!sgLev) sgLev=sg; // fallback
+    if(!sgLev) sgLev=sg;
 
-    // Coarse grid coordinates
-    const float cgx=gx/(1<<shift), cgy=gy/(1<<shift), cgz=gz/(1<<shift);
+    const float scale=1.f/(float)(1<<level);
+    const float cgx=gx*scale, cgy=gy*scale, cgz=gz*scale;
     const int cix0=(int)floorf(cgx), ciy0=(int)floorf(cgy), ciz0=(int)floorf(cgz);
     const float cfx=cgx-cix0, cfy=cgy-ciy0, cfz=cgz-ciz0;
 
@@ -1646,16 +1683,26 @@ int flip_dam_break( int resolution, int blockSize, int nSteps )
             }
         }
 
-        // CFL adaptive time step
-        float maxVel=0.f;
-        for(const FlipParticle &p : gParticles)
+        // CFL adaptive time step (adaptive grid対応: max(|u|/dx_level))
+        float maxInvDt=0.f;
         {
-            float v2=p.vel.x*p.vel.x+p.vel.y*p.vel.y+p.vel.z*p.vel.z;
-            if(v2>maxVel) maxVel=v2;
+            const int bl0=sgVel->bsxLog2();
+            const int nbx0=sgVel->nbx(), nby0=sgVel->nby();
+            const int sxG0=sgVel->sx(), syG0=sgVel->sy(), szG0=sgVel->sz();
+            for(const FlipParticle &p : gParticles)
+            {
+                int pix=std::max(0,std::min((int)floorf(p.pos.x),sxG0-1));
+                int piy=std::max(0,std::min((int)floorf(p.pos.y),syG0-1));
+                int piz=std::max(0,std::min((int)floorf(p.pos.z),szG0-1));
+                int pbid=(pix>>bl0)+(piy>>bl0)*nbx0+(piz>>bl0)*nbx0*nby0;
+                int plevel=msbg->getBlockLevel(pbid);
+                float dx=(float)(1<<plevel);
+                float speed=sqrtf(p.vel.x*p.vel.x+p.vel.y*p.vel.y+p.vel.z*p.vel.z);
+                maxInvDt=std::max(maxInvDt, speed/dx);
+            }
         }
-        maxVel=sqrtf(maxVel);
-        const float dt=(maxVel>1e-6f)
-            ? std::min(DT_MAX, std::max(DT_MIN, CFL_NUMBER/maxVel))
+        const float dt=(maxInvDt>1e-6f)
+            ? std::min(DT_MAX, std::max(DT_MIN, CFL_NUMBER/maxInvDt))
             : DT_MAX;
 
         TIMER_START(&tm2);
@@ -1674,9 +1721,9 @@ int flip_dam_break( int resolution, int blockSize, int nSteps )
         advectParticles(   sx,sy,sz,dt);
         TIMER_STOP(&tm2); double t_adv=TIMER_DIFF_MS(&tm2);
         TIMER_STOP(&tm);
-        TRCP(("step %3d/%d  particles=%d  activeBlocks=%d  %.3f sec  dt=%.4f maxVel=%.1f\n",
+        TRCP(("step %3d/%d  particles=%d  activeBlocks=%d  %.3f sec  dt=%.4f maxInvDt=%.1f\n",
               step+1,nSteps,(int)gParticles.size(),(int)gActiveBlocks.size(),
-              (double)TIMER_DIFF_MS(&tm)/1000.0, dt, maxVel));
+              (double)TIMER_DIFF_MS(&tm)/1000.0, dt, maxInvDt));
         TRCP(("  P2G=%.1f Grav=%.1f Press=%.1f G2P=%.1f Adv=%.1f ms\n",
               t_p2g,t_grav,t_press,t_g2p,t_adv));
         saveParticleSlice(step,sx,sy,sz);
