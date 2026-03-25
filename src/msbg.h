@@ -825,11 +825,36 @@ using namespace SBG;
 /*-----------------------------------------------------------------------*/
 /* 									 */
 /*-----------------------------------------------------------------------*/
+// FLIP pressure solver callback interface
+struct FlipPressureCallbacks
+{
+  CellFlags (*sampleCellType)(void *user, int x, int y, int z);
+  float (*sampleFaceCoeff)(void *user, int dir, int x, int y, int z);
+  float (*sampleRhs)(void *user, int x, int y, int z);
+  void *user;
+};
+
+struct FlipPressureSolveParams
+{
+  int nPre         = 3;
+  int nPost        = 3;
+  int nCoarse      = 24;
+  int maxIter      = 500;
+  float tol        = 5e-4f;
+};
+
 class MultiresSparseGrid
 {
   public:
   class BlockIterator;
 //  class EikonalSolver;
+
+  // FLIP pressure solver: prepare internal state (cell flags, face weights,
+  // diagonal, block lists, channel allocation) then solve via MG-PCG.
+  void preparePressureSolveFLIP( const FlipPressureCallbacks &cb,
+                                 unsigned options = 0 );
+  int  solvePressureFLIP( const FlipPressureSolveParams &params,
+                          float *outRelResidual = nullptr );
 
   static
   MultiresSparseGrid *create( 
@@ -2210,7 +2235,19 @@ class MultiresSparseGrid
   void downsampleChannel( int levelMg,  // target level
 			  int chSrc,
 			  int chDst,
-			  unsigned options = 0			  
+			  unsigned options = 0
+			  );
+
+  // Prolongation: coarse -> fine copy-add (inverse of downsampleChannel)
+  // levelMgFine = target fine MG level
+  // Reads chSrc at levelMgFine+1, adds alpha*value into chDst at levelMgFine
+  // MG_CONST_PROLONGATION: 2x2x2 constant interpolation (piecewise constant)
+  template<typename data_T>
+  void prolongateChannel( int levelMgFine,
+			  int chSrc,
+			  int chDst,
+			  unsigned options = 0,
+			  float alpha = MG_CONST_PROLONGATION_ALPHA
 			  );
 
   void downsampleVelocity( int levelMg,  // target level
@@ -3268,13 +3305,26 @@ class MultiresSparseGrid
 
   void relax(  int boundaryZoneOnly,
       		  int reverseOrder,
-      			     int levelMg,     					    
+      			     int levelMg,
 			     int chanX,
 			     int chanB,
 			     int chanTmp,
 			     int nIter,
 			     unsigned options=0
 			     );
+
+  // V-cycle multigrid: pre-smooth -> residual -> restrict -> coarse solve -> prolongate -> post-smooth
+  // chX = solution (in/out), chB = rhs (read-only at this level)
+  // chResidual, chTmp = work channels
+  void vCycle( int levelMg,
+	       int chX,
+	       int chB,
+	       int chResidual,
+	       int chTmp,
+	       int nPre = 2,
+	       int nPost = 2,
+	       int nCoarse = 24
+	       );
 
   void setChannel( double a, int iChanDstY,
       		    int levelMax=-1, int levelMg=0, CellFlags cellMask=0,
@@ -3419,6 +3469,17 @@ class MultiresSparseGrid
 		   _blocksValue[MSBG_MAXRESLEVELS];
 
   int _mgArActNumIter[MSBG_MAXRESLEVELS];
+
+  // FLIP pressure solver helpers
+  void preparePressureSolveFLIPLevel0_( const FlipPressureCallbacks &cb );
+  void restrictPressureMetaFLIP_( int levelMgCoarse );
+  void buildRelaxationBlocksFLIP_( int levelMg );
+  void allocPressureChannelsFLIP_( int levelMgMax );
+  void computeDiagonalFLIP_( int levelMg );
+  void computeMgDiagRef_( int levelMg );
+  void restrictResidualFLIP_( int levelMgCoarse, int chFineR, int chCoarseRhs );
+  void solvePressureFLIPPCG_( const FlipPressureSolveParams &params,
+                              int *outIters, float *outRelResidual );
 
   void sortBlockListMorton( std::vector<int>& blockList );
 
@@ -3720,6 +3781,7 @@ class MultiresSparseGrid
   	_mgSmOmegaDefault,
   	_mgSmOmegaSched1,
 	_mgSmOmegaSched2;
+  float _mgDiagRef[8];  // per-MG-level reference 1/diag for density-scaled smoother
   int 	_mgSmType,
 	_mgSmIter,
 	_mgSmBlockIter,

@@ -888,6 +888,8 @@ class SparseGrid
     }
     else
     {
+      if(!inRange(x,y,z))
+        return _emptyValue;
       return getValue(x,y,z);
     }
   }

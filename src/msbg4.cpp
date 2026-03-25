@@ -1914,6 +1914,122 @@ void MultiresSparseGrid::downsampleChannel( int levelMg,  // target level
 }
 
 /*-------------------------------------------------------------------------*/
+/* Prolongation: coarse -> fine constant interpolation (copy-add)          */
+/* Reverse of downsampleChannel for V-cycle correction                    */
+/*-------------------------------------------------------------------------*/
+template<typename data_T>
+void MultiresSparseGrid::prolongateChannel(
+    int levelMgFine,
+    int chSrc,
+    int chDst,
+    unsigned options,
+    float alpha )
+{
+  UT_ASSERT0(levelMgFine >= 0);
+  UT_ASSERT0(levelMgFine + 1 < _mgLevels);
+
+  int doTimer = FALSE;
+  UtTimer tm;
+
+  if(_psTraceDetail)
+  {
+    TRC(("%s lFine=%d %d %d alpha=%g\n",UT_FUNCNAME,levelMgFine,chSrc,chDst,alpha));
+    doTimer = levelMgFine <= TIMER_MAX_LEVEL+1;
+  }
+
+  if(doTimer) TIMER_START(&tm);
+
+  bool doUseFlagsChannel = !(options & OPT_ALL_CELLS);
+
+  prepareDataAccess( chDst, -1, levelMgFine );
+  prepareDataAccess( chSrc, -1, levelMgFine + 1 );
+
+  // Iterate over blocks at the fine MG level
+  BlockGridInfo bgi( this, levelMgFine );
+
+  ThrRunParallel<int>( bgi._nBlocks, nullptr,
+    [&](int &tls, int tid, int bid)
+    {
+      int level0, level;
+      getBlockLevel( bid, levelMgFine, level0, level );
+
+      SparseGrid<CellFlags>
+        *sgFlags = getFlagsChannel(CH_CELL_FLAGS, level, levelMgFine);
+      SparseGrid<data_T>
+        *sgDst = getChannel<data_T>(this, chDst, level, levelMgFine);
+      UT_ASSERT2( sgDst );
+
+      CellFlags *dataFlags = doUseFlagsChannel ?
+                             sgFlags->getDataPtrGen_(bid,0,0) : NULL;
+      data_T *dataDst = sgDst->getDataPtrGen_(bid,1,0);
+
+      if(level0 >= levelMgFine + 1)
+      {
+        // Block was NOT coarsened at this MG transition:
+        // same resolution at both levels -> simple copy-add
+        SparseGrid<data_T>
+          *sgSrc = getChannel<data_T>(this, chSrc, level, levelMgFine + 1);
+
+        if( levelMgFine + 1 < getNumMgLevels() &&
+            !sgSrc->isValueBlock(bid) )
+        {
+          // Constant block (typically zero) - skip if zero
+          return;
+        }
+
+        data_T *dataSrc = sgSrc->getDataPtrGen_(bid,0,0);
+        if(!dataSrc) return; // NULL block = zero
+
+        for(int vid = 0; vid < sgFlags->nVoxelsInBlock(); vid++)
+        {
+          if( doUseFlagsChannel &&
+              dataFlags && (dataFlags[vid] & (CELL_SOLID|CELL_VOID)) )
+            continue;
+          dataDst[vid] += (data_T)(alpha * dataSrc[vid]);
+        }
+        return;
+      }
+
+      // Block WAS coarsened: actual coarse->fine prolongation
+      // Fine cell at grid coords (x,y,z) reads coarse parent at (x>>1,y>>1,z>>1)
+      int levelCoarse = levelMgFine + 1;
+      SparseGrid<data_T>
+        *sgSrcCoarse = getChannel<data_T>(this, chSrc, levelCoarse, levelCoarse);
+
+      if(!sgSrcCoarse) return;
+
+      BlockAccessor bac(&bgi, sgFlags, bid, level);
+      for(int vz = 0; vz < bac._bsz; vz++)
+      for(int vy = 0; vy < bac._bsy; vy++)
+      for(int vx = 0; vx < bac._bsx; vx++)
+      {
+        LongInt vid = bac.getCellIndex( vx, vy, vz );
+
+        if( doUseFlagsChannel &&
+            dataFlags && (dataFlags[vid] & (CELL_SOLID|CELL_VOID)) )
+          continue;
+
+        int x, y, z;
+        bac.getGridCoords( vx, vy, vz, x, y, z );
+
+        // Piecewise constant: each fine cell gets parent coarse value
+        int xc = x >> 1, yc = y >> 1, zc = z >> 1;
+
+        data_T ec = sgSrcCoarse->getValue(xc, yc, zc);
+        dataDst[vid] += (data_T)(alpha * ec);
+      }
+    } ); // blocks
+
+  if(doTimer)
+  {
+    TIMER_STOP(&tm);
+    TRC(("CPU(prolongate L%d->L%d) =%.2f sec\n",
+         levelMgFine+1, levelMgFine,
+         (double)TIMER_DIFF_MS(&tm)/1000.));
+  }
+}
+
+/*-------------------------------------------------------------------------*/
 /* 									   */
 /*-------------------------------------------------------------------------*/
 void MultiresSparseGrid::downsampleVelocity( int levelMg,  // target level
@@ -2675,12 +2791,15 @@ void smoothBlockSIMD4f(
 /* 									   */
 /*-------------------------------------------------------------------------*/
 
-template void MultiresSparseGrid::downsampleChannel<float,float>( 
+template void MultiresSparseGrid::downsampleChannel<float,float>(
     int levelMg, int chSrc, int chDst, unsigned options );
-template void MultiresSparseGrid::downsampleChannel<Vec3Float,Vec3Float>( 
+template void MultiresSparseGrid::downsampleChannel<Vec3Float,Vec3Float>(
     int levelMg, int chSrc, int chDst, unsigned options );
-template void MultiresSparseGrid::downsampleChannel<Vec3Uint16,Vec3Float>( 
+template void MultiresSparseGrid::downsampleChannel<Vec3Uint16,Vec3Float>(
     int levelMg, int chSrc, int chDst, unsigned options );
+
+template void MultiresSparseGrid::prolongateChannel<float>(
+    int levelMgFine, int chSrc, int chDst, unsigned options, float alpha );
 
 
 } // namespace MSBG

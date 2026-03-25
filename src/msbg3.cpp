@@ -166,7 +166,7 @@ void procNeighMixedRes2(
 static inline 
 void ImultiplyLaplacianMatrixProcessSliceDenseLevel(
     		        int iIter, int pass_red_black,
-    			int z0,  // z-slice to process			
+    			int z0,  // z-slice to process
 			int doJacobi,
 			int doReverseOrder,
     			int doBoundZoneOnly,
@@ -183,6 +183,7 @@ void ImultiplyLaplacianMatrixProcessSliceDenseLevel(
 			PSFloat *dataDstY,
 			bool doBypassCache,
 			bool usePhysicalAirVelocity,
+			float diagRefDense=0.f,
 			UtPerfStats *pfs=NULL
 			)
 {
@@ -1198,7 +1199,7 @@ void MultiresSparseGrid::IprocessBlockLaplacian(
         #endif
 
 
-	if(( blockHasSkippableSIMD && (tmpDataF[iSimd] & (1<<1) ))) 
+	if(( blockHasSkippableSIMD && (tmpDataF[iSimd] & (1<<1) )))
 	{
 	  #ifdef SKIP_NONFLUID_SIMD_STATS
 	  skipstats.update(1);
@@ -1321,7 +1322,7 @@ void MultiresSparseGrid::IprocessBlockLaplacian(
 	  else
 	  {
 	    B.load_a(dataB+vid);
-	    Y = omega*(B+S)*D  + oneMinusOmega * F0;
+	    Y = select( D!=0.0f, omega*(B+S)*D + oneMinusOmega * F0, F0 );
 
 	    #ifdef ADAPTIVE_BLOCK_LOCAL_RELAX
 	    //UT_ASSERT0( !vany(D==0.0f) );
@@ -1832,9 +1833,9 @@ void MultiresSparseGrid::multiplyLaplacianMatrixOpt(
 
   // Initialze per-thread data
   processBlockLaplacian<LAPL_MULTIPLY|LAPL_INIT_THREAD_LOCALS>
-    (-1,0,0,0,0,0,NULL,0,0,0,0,0,NULL);  
+    (-1,0,0,0,0,0,NULL,0,0,0,0,0,NULL);
 
-  // 
+  //
   // Main loop over all blocks
   //
   typedef struct
@@ -1845,20 +1846,19 @@ void MultiresSparseGrid::multiplyLaplacianMatrixOpt(
 
   int nActBlocks = blockList ? blockList->size() : _nBlocks;
 
-  ThrRunParallel<ThreadLocals>( nActBlocks, 
-    [&]( ThreadLocals &tls, int tid )  
+  ThrRunParallel<ThreadLocals>( nActBlocks,
+    [&]( ThreadLocals &tls, int tid )
     {
       tls.alpha = 0;
     },
 
-    [&](ThreadLocals &tls, int tid, int bid) 
+    [&](ThreadLocals &tls, int tid, int bid)
     {
       if(blockList) bid = (*blockList)[bid];
       UT_ASSERT2(bid>=0&&bid<_nBlocks);
 
       BlockInfo *bi = getBlockInfo(bid,levelMg);
-
-      if((doBoundZoneOnly) && !(bi->flags & BLK_BOUNDARY_ZONE)) 
+      if((doBoundZoneOnly) && !(bi->flags & BLK_BOUNDARY_ZONE))
       {
 	return;
       }
@@ -2117,16 +2117,17 @@ xxxx   int nThreads = MAX(nMaxThreads/4,4); // TODO: optimze dependent on proble
 	#endif
 
 	ImultiplyLaplacianMatrixProcessSliceDenseLevel( iIter, pass_red_black,
-	    z, 
+	    z,
 	    doJacobi, doReverseOrder, doBoundZoneOnly, doCalcResidual,
 	    sx,sy,sz, yStrid,zStrid,
 	    h, omegaAct,
-	    sg, 
+	    sg,
 	    dataFlags, dataX, dataB, dataD,
 	    dataFaceArea,
 	    dataDstY,
 	    doBypassCache,
-	    false
+	    false,
+	    _mgDiagRef[levelMg]
 	    #ifdef MSBG_PERF_STATS
 	    ,&perfstats[tid]
 	    #endif
@@ -2217,7 +2218,7 @@ LongInt MultiresSparseGrid::relaxBlockList(
 	}
 	#endif
 
-	processBlockLaplacian<LAPL_RELAX>( 
+	processBlockLaplacian<LAPL_RELAX>(
 	    	    tid, options, bid, bx, by, bz, bi, levelMg, 
 		    chanX, chanB, chanDstY, 
 		    _mgSmBlockIter, NULL );
@@ -2320,7 +2321,6 @@ void MultiresSparseGrid::relax(   int boundaryZoneOnly,
     {
       blocksRelax = &_blocksRelax[levelMg];
     }
-
     #ifdef RELAX_BLOCKS_RED_BLACK
     int chRead = chanX,
         chWrite = chanX;
@@ -2366,6 +2366,908 @@ void MultiresSparseGrid::relax(   int boundaryZoneOnly,
   #ifdef CHECK_NONFLUID_ZERO_POST
   checkChannelNonFluidZero(chanX,levelMg);
   #endif
+}
+
+/*-------------------------------------------------------------------------*/
+// Zero all existing blocks of a float channel without creating const blocks.
+// Unlike setChannel(0.0,...) this avoids const-block substitution that causes
+// alloc-on-write thrashing in the monotonic block pool.
+static void zeroChannelInPlace(MultiresSparseGrid *msg, int ch, int levelMg)
+{
+  for(int level = 0; level < msg->getNumLevels(); level++)
+  {
+    auto *sg = msg->getFloatChannel(ch, level, levelMg);
+    if(!sg) continue;
+    for(LongInt bid = 0; bid < sg->nBlocks(); bid++)
+    {
+      MSBG::BlockInfo *bi = msg->getBlockInfo((int)bid, levelMg);
+      if(!bi || bi->level != level) continue;
+
+      // Try read-only first to reuse existing block
+      float *d = sg->getBlockDataPtr((int)bid);
+      if(d)
+      {
+        memset(d, 0, sg->nVoxelsInBlock() * sizeof(float));
+      }
+      else
+      {
+        // First time: allocate + zero
+        sg->getBlockDataPtr((int)bid, 1, 1);
+      }
+    }
+  }
+}
+
+/*-------------------------------------------------------------------------*/
+/* V-cycle multigrid solver / preconditioner                               */
+/* chX = solution (in/out), chB = rhs (read-only at this level)            */
+/* chResidual, chTmp = work channels                                       */
+/*                                                                         */
+/* Channel usage per level:                                                */
+/*   chX       - solution (zero-initialized on entry for correction)       */
+/*   chB       - right-hand side                                           */
+/*   chResidual - residual r = b - Ax, also used as coarse RHS             */
+/*   chTmp     - temporary for relax (swap buffer)                         */
+/*-------------------------------------------------------------------------*/
+void MultiresSparseGrid::vCycle(
+    int levelMg,
+    int chX,
+    int chB,
+    int chResidual,
+    int chTmp,
+    int nPre,
+    int nPost,
+    int nCoarse )
+{
+  // Dense level はチャンネル管理が異なるため、sparse levelのみ使用
+  const int coarsest = getNumLevels() - 1;
+
+  // Base case: coarsest level — direct solve via relaxation
+  if(levelMg >= coarsest)
+  {
+    relax( 0, 0, levelMg, chX, chB, chTmp, nCoarse, 0 );
+    return;
+  }
+
+  // 1. Pre-smoothing
+  relax( 0, 0, levelMg, chX, chB, chTmp, nPre, 0 );
+
+  // 2. Compute residual: chResidual = chB - A * chX
+  multiplyLaplacianMatrixOpt(
+      OPT_CALC_RESIDUAL,
+      levelMg,
+      chX,           // current solution
+      chB,           // right-hand side
+      0.0f,          // no diffusion
+      chResidual,    // output: r = b - Ax
+      nullptr,       // no dot product
+      nullptr        // all blocks
+  );
+
+  // 3. Restrict residual to coarse level: coarse_rhs = R * residual
+  //    Use chB at coarse level as the coarse RHS
+  zeroChannelInPlace(this, chB, levelMg + 1);
+  downsampleChannel<float,float>( levelMg + 1, chResidual, chB,
+                                  OPT_SIMPLE_AVERAGE | OPT_ALL_CELLS );
+
+  // 4. Zero the coarse solution (in-place to avoid alloc-on-write)
+  zeroChannelInPlace(this, chX, levelMg + 1);
+
+  // 5. Recurse on coarse level
+  vCycle( levelMg + 1, chX, chB, chResidual, chTmp, nPre, nPost, nCoarse );
+
+  // 6. Prolongate coarse correction and add to fine solution: x += P * e_c
+  prolongateChannel<float>( levelMg, chX, chX, 0,
+                            MG_CONST_PROLONGATION_ALPHA );
+
+  // 7. Post-smoothing (reverse order for symmetry)
+  relax( 0, 1 /*reverseOrder*/, levelMg, chX, chB, chTmp, nPost, 0 );
+}
+
+/*=========================================================================
+ *  FLIP Pressure Solver — MSBG-internal implementation
+ *=========================================================================*/
+
+/*-------------------------------------------------------------------------*/
+void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
+    const FlipPressureCallbacks &cb )
+{
+  const int levelMg = 0;
+
+  // --- cell flags ---
+  for(int level = 0; level < _nLevels; level++)
+  {
+    auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
+    if(!sgF) continue;
+    sgF->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+    const int bsx = sgF->bsx();
+
+    for(LongInt bidL = 0; bidL < sgF->nBlocks(); bidL++)
+    {
+      const int bid = (int)bidL;
+      BlockInfo *bi = getBlockInfo(bid, levelMg);
+      if(!bi || bi->level != level) continue;
+
+      CellFlags *dst = sgF->getBlockDataPtr(bid, 1, 0);
+      if(!dst) continue;
+
+      int bx,by,bz;
+      _sg0->getBlockCoordsById(bid, bx, by, bz);
+      const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
+
+      bool hasLiquid = false;
+      for(int vz=0, vid=0; vz<bsx; ++vz)
+      for(int vy=0; vy<bsx; ++vy)
+      for(int vx=0; vx<bsx; ++vx, ++vid)
+      {
+        CellFlags fl = cb.sampleCellType(cb.user, gx0+vx, gy0+vy, gz0+vz);
+        fl &= (CELL_SOLID | CELL_VOID | CELL_FIXED);
+        dst[vid] = fl;
+
+        if(!(fl & (CELL_SOLID | CELL_VOID))) hasLiquid = true;
+      }
+
+      bi->flags |= BLK_EXISTS;
+      if(hasLiquid) bi->flags &= ~BLK_NO_FLUID;
+      else          bi->flags |=  BLK_NO_FLUID;
+      bi->flags &= ~BLK_FIXED;
+    }
+  }
+
+  // --- face weights (beta into CH_FACE_AREA) ---
+  for(int dir = 0; dir < 3; dir++)
+  {
+    for(int level = 0; level < _nLevels; level++)
+    {
+      auto *sgW = getFaceAreaChannel(dir, level, levelMg);
+      if(!sgW) continue;
+      sgW->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+      const int bsx = sgW->bsx();
+
+      for(LongInt bidL = 0; bidL < sgW->nBlocks(); bidL++)
+      {
+        const int bid = (int)bidL;
+        BlockInfo *bi = getBlockInfo(bid, levelMg);
+        if(!bi || bi->level != level) continue;
+
+        float *w = sgW->getBlockDataPtr(bid, 1, 0);
+        if(!w) continue;
+
+        int bx,by,bz;
+        _sg0->getBlockCoordsById(bid, bx, by, bz);
+        const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
+
+        for(int vz=0, vid=0; vz<bsx; ++vz)
+        for(int vy=0; vy<bsx; ++vy)
+        for(int vx=0; vx<bsx; ++vx, ++vid)
+        {
+          w[vid] = cb.sampleFaceCoeff(cb.user, dir, gx0+vx, gy0+vy, gz0+vz);
+        }
+      }
+    }
+  }
+
+  // --- RHS (divergence) ---
+  {
+    auto *sgRhs = getFloatChannel(CH_DIVERGENCE, 0, levelMg);
+    if(sgRhs)
+    {
+      sgRhs->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+      const int bsx = sgRhs->bsx();
+
+      for(LongInt bidL = 0; bidL < sgRhs->nBlocks(); bidL++)
+      {
+        const int bid = (int)bidL;
+        BlockInfo *bi = getBlockInfo(bid, levelMg);
+        if(!bi || bi->level != 0) continue;
+
+        float *r = sgRhs->getBlockDataPtr(bid, 1, 0);
+        if(!r) continue;
+
+        int bx,by,bz;
+        _sg0->getBlockCoordsById(bid, bx, by, bz);
+        const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
+
+        for(int vz=0, vid=0; vz<bsx; ++vz)
+        for(int vy=0; vy<bsx; ++vy)
+        for(int vx=0; vx<bsx; ++vx, ++vid)
+        {
+          r[vid] = cb.sampleRhs(cb.user, gx0+vx, gy0+vy, gz0+vz);
+        }
+      }
+    }
+  }
+
+  // --- zero pressure ---
+  setChannel(0.0, CH_PRESSURE, -1, levelMg);
+}
+
+/*-------------------------------------------------------------------------*/
+void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
+{
+  // For levelMg > 0 (coarser MG levels), use simple face-weight sum.
+  // For levelMg = 0 (fine level with mixed-resolution blocks), use
+  // matrix-vector product to ensure diagonal matches the actual stencil.
+
+  // ---- Step 1: Set cell flags (CELL_PARTIAL_SOLID, BLK_CUTS_SOLID) ----
+  for(int level = levelMg; level < _nLevels; level++)
+  {
+    auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
+    auto *sgD = getPSFloatChannel(CH_DIAGONAL, level, levelMg);
+    auto *sgFU = getFaceAreaChannel(0, level, levelMg);
+    auto *sgFV = getFaceAreaChannel(1, level, levelMg);
+    auto *sgFW = getFaceAreaChannel(2, level, levelMg);
+    if(!sgF || !sgD) continue;
+
+    sgD->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+
+    const bool hasFaceArea = (sgFU && sgFV && sgFW);
+
+    for(int bid = 0; bid < _nBlocks; bid++)
+    {
+      BlockInfo *bi = getBlockInfo(bid, levelMg);
+      if(!bi || bi->level != level) continue;
+      if(!(bi->flags & BLK_EXISTS)) continue;
+
+      CellFlags *f = sgF->getBlockDataPtr(bid);
+      PSFloat   *d = sgD->getBlockDataPtr(bid, 1, 0);
+      if(!f || !d) continue;
+
+      int bx,by,bz;
+      _sg0->getBlockCoordsById(bid, bx, by, bz);
+      const int bsx = sgF->bsx();
+
+      // Check for mixed-res neighbors
+      bool hasMixedResNeighbor = false;
+      {
+        const int offs[6][3] = {{-1,0,0},{1,0,0},{0,-1,0},{0,1,0},{0,0,-1},{0,0,1}};
+        for(int fi=0; fi<6; fi++)
+        {
+          int bx2=bx+offs[fi][0], by2=by+offs[fi][1], bz2=bz+offs[fi][2];
+          if(!sgF->blockCoordsInRange(bx2,by2,bz2)) continue;
+          int bid2 = sgF->getBlockIndex(bx2,by2,bz2);
+          BlockInfo *bi2 = getBlockInfo(bid2, levelMg);
+          if(bi2 && bi2->level != level) { hasMixedResNeighbor = true; break; }
+        }
+      }
+
+      bi->flags &= ~BLK_CUTS_SOLID;
+      bool blockHasVariableCoeff = false;
+
+      for(int vz=0, vid=0; vz<bsx; ++vz)
+      for(int vy=0; vy<bsx; ++vy)
+      for(int vx=0; vx<bsx; ++vx, ++vid)
+      {
+        f[vid] &= ~CELL_PARTIAL_SOLID;
+
+        if(f[vid] & (CELL_SOLID | CELL_VOID | CELL_FIXED))
+        { d[vid] = 0; continue; }
+
+        // Set initial diagonal to 1/6 (will be corrected for levelMg=0)
+        d[vid] = (PSFloat)(1.f / 6.f);
+
+        // For FLIP 2-phase: face weights are density-dependent (not area
+        // fractions), so nearly ALL fluid cells have non-unit coefficients.
+        // Always flag as variable to ensure processBlockLaplacian uses
+        // the weighted stencil path (W1*F1 + ...) instead of the
+        // uniform path (F1 + F2 + ...).
+        if(hasFaceArea)
+        {
+          f[vid] |= CELL_PARTIAL_SOLID;
+          blockHasVariableCoeff = true;
+        }
+        else if(hasMixedResNeighbor &&
+                (vx==0 || vx==bsx-1 || vy==0 || vy==bsx-1 || vz==0 || vz==bsx-1))
+        {
+          f[vid] |= CELL_PARTIAL_SOLID;
+          blockHasVariableCoeff = true;
+        }
+      }
+
+      if(blockHasVariableCoeff) bi->flags |= BLK_CUTS_SOLID;
+    }
+  }
+
+  // ---- Step 2: Compute correct diagonal from face weight sum ----
+  if(levelMg == 0)
+  {
+    // Direct diagonal: sum of 6 face weights per cell.
+    // For staggered MAC grid, face weight at cell (gx,gy,gz) is:
+    //   xLeft  = FU(gx,   gy, gz)    xRight = FU(gx+1, gy, gz)
+    //   yBot   = FV(gx, gy,   gz)    yTop   = FV(gx, gy+1, gz)
+    //   zBack  = FW(gx, gy, gz)      zFront = FW(gx, gy, gz+1)
+    // getValueGen_ returns _emptyValue (0) for out-of-range coords.
+
+    for(int level = 0; level < _nLevels; level++)
+    {
+      auto *sgD  = getPSFloatChannel(CH_DIAGONAL, level, 0);
+      auto *sgF  = getFlagsChannel(CH_CELL_FLAGS, level, 0);
+      auto *sgFU = getFaceAreaChannel(0, level, 0);
+      auto *sgFV = getFaceAreaChannel(1, level, 0);
+      auto *sgFW = getFaceAreaChannel(2, level, 0);
+      if(!sgD || !sgF) continue;
+      if(!sgFU || !sgFV || !sgFW) continue;
+
+      sgFU->prepareDataAccess(SBG::ACC_READ);
+      sgFV->prepareDataAccess(SBG::ACC_READ);
+      sgFW->prepareDataAccess(SBG::ACC_READ);
+
+      for(int bid = 0; bid < _nBlocks; bid++)
+      {
+        BlockInfo *bi = getBlockInfo(bid, 0);
+        if(!bi || bi->level != level) continue;
+        if(!(bi->flags & BLK_EXISTS)) continue;
+
+        PSFloat   *d = sgD->getBlockDataPtr(bid);
+        CellFlags *f = sgF->getBlockDataPtr(bid);
+        if(!d || !f) continue;
+
+        int bx,by,bz;
+        _sg0->getBlockCoordsById(bid, bx, by, bz);
+        const int bsx = sgF->bsx();
+        const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
+
+        for(int vz=0, vid=0; vz<bsx; ++vz)
+        for(int vy=0; vy<bsx; ++vy)
+        for(int vx=0; vx<bsx; ++vx, ++vid)
+        {
+          if(f[vid] & (CELL_SOLID | CELL_VOID | CELL_FIXED))
+          { d[vid] = 0; continue; }
+
+          const int gx = gx0+vx, gy = gy0+vy, gz = gz0+vz;
+
+          // Sum of 6 face weights (MAC staggered: left face stored at cell pos)
+          float sum = sgFU->getValueGen_(gx,   gy, gz)     // x-left
+                    + sgFU->getValueGen_(gx+1, gy, gz)     // x-right
+                    + sgFV->getValueGen_(gx, gy,   gz)     // y-bottom
+                    + sgFV->getValueGen_(gx, gy+1, gz)     // y-top
+                    + sgFW->getValueGen_(gx, gy, gz)       // z-back
+                    + sgFW->getValueGen_(gx, gy, gz+1);    // z-front
+
+          d[vid] = (sum > 1e-12f) ? (PSFloat)(1.f / sum) : (PSFloat)0;
+        }
+      }
+    }
+
+  }
+  else
+  {
+    // Coarser MG levels: approximate 6-face weight sum
+    // Note: exact getValueGen_ approach was tested but empirically the
+    // simple 2*(fu+fv+fw) approximation works better with the current
+    // V-cycle structure due to face weight averaging in restriction.
+    for(int level = levelMg; level < _nLevels; level++)
+    {
+      auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
+      auto *sgD = getPSFloatChannel(CH_DIAGONAL, level, levelMg);
+      auto *sgFU = getFaceAreaChannel(0, level, levelMg);
+      auto *sgFV = getFaceAreaChannel(1, level, levelMg);
+      auto *sgFW = getFaceAreaChannel(2, level, levelMg);
+      if(!sgF || !sgD) continue;
+      if(!sgFU || !sgFV || !sgFW) continue;
+
+      for(int bid = 0; bid < _nBlocks; bid++)
+      {
+        BlockInfo *bi = getBlockInfo(bid, levelMg);
+        if(!bi || bi->level != level) continue;
+        if(!(bi->flags & BLK_EXISTS)) continue;
+
+        CellFlags *f = sgF->getBlockDataPtr(bid);
+        PSFloat   *d = sgD->getBlockDataPtr(bid);
+        if(!f || !d) continue;
+
+        float *fu = sgFU->getBlockDataPtr(bid);
+        float *fv = sgFV->getBlockDataPtr(bid);
+        float *fw = sgFW->getBlockDataPtr(bid);
+        if(!fu||!fv||!fw) continue;
+
+        const int bsx = sgF->bsx();
+        for(int vz=0, vid=0; vz<bsx; ++vz)
+        for(int vy=0; vy<bsx; ++vy)
+        for(int vx=0; vx<bsx; ++vx, ++vid)
+        {
+          if(f[vid] & (CELL_SOLID | CELL_VOID | CELL_FIXED))
+          { d[vid] = 0; continue; }
+
+          float sum = fu[vid] + fv[vid] + fw[vid];
+          sum *= 2.0f;
+          d[vid] = (sum > 1e-12f) ? (PSFloat)(1.f / sum) : (PSFloat)0;
+        }
+      }
+    }
+  }
+}
+
+/*-------------------------------------------------------------------------*/
+void MultiresSparseGrid::computeMgDiagRef_( int levelMg )
+{
+  // Find the minimum positive 1/diag among fluid cells at this MG level.
+  // This serves as the reference for density-scaled omega in the smoother.
+  double minPos = 1e30;
+  for(int level = levelMg; level < _nLevels; level++)
+  {
+    auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
+    auto *sgD = getPSFloatChannel(CH_DIAGONAL, level, levelMg);
+    if(!sgF || !sgD) continue;
+    for(int bid = 0; bid < _nBlocks; bid++)
+    {
+      BlockInfo *bi = getBlockInfo(bid, levelMg);
+      if(!bi || bi->level != level || !(bi->flags & BLK_EXISTS)) continue;
+      CellFlags *f = sgF->getBlockDataPtr(bid);
+      PSFloat   *d = sgD->getBlockDataPtr(bid);
+      if(!f || !d) continue;
+      const int n = sgF->nVoxelsInBlock();
+      for(int i = 0; i < n; i++)
+        if(!(f[i] & (CELL_SOLID|CELL_VOID|CELL_FIXED)) && d[i] > 1e-12f)
+          minPos = std::min(minPos, (double)d[i]);
+    }
+  }
+  _mgDiagRef[levelMg] = (minPos < 1e29) ? (float)minPos : (1.f/6.f);
+}
+
+/*-------------------------------------------------------------------------*/
+void MultiresSparseGrid::restrictResidualFLIP_(
+    int levelMgCoarse, int chFineR, int chCoarseRhs )
+{
+  // Density-weighted residual restriction (gamma=0.5):
+  //   r_coarse = sum(sqrt(D_i) * r_i) / sum(sqrt(D_i))
+  // where D_i = 1/A_ii (stored in CH_DIAGONAL).
+  // Liquid cells (small D) get downweighted, preventing air-region
+  // residuals from drowning out liquid-region information.
+
+  const int levelMgFine = levelMgCoarse - 1;
+
+  for(int level = 0; level < _nLevels; level++)
+  {
+    auto *sgDst = getFloatChannel(chCoarseRhs, level, levelMgCoarse);
+    auto *sgSrc = getFloatChannel(chFineR,     level, levelMgFine);
+    auto *sgD   = getPSFloatChannel(CH_DIAGONAL, level, levelMgFine);
+    auto *sgF   = getFlagsChannel(CH_CELL_FLAGS, level, levelMgFine);
+    if(!sgDst || !sgSrc || !sgD || !sgF) continue;
+
+    for(LongInt bidL = 0; bidL < sgDst->nBlocks(); bidL++)
+    {
+      const int bid = (int)bidL;
+      BlockInfo *bi = getBlockInfo(bid, levelMgCoarse);
+      if(!bi || bi->level != level) continue;
+
+      float *dst = sgDst->getBlockDataPtr(bid, 1, 0);
+      if(!dst) continue;
+
+      int bx,by,bz;
+      _sg0->getBlockCoordsById(bid, bx, by, bz);
+      const int bs = sgDst->bsx();
+      const int gx0 = bx*bs, gy0 = by*bs, gz0 = bz*bs;
+
+      for(int vz=0, vid=0; vz<bs; ++vz)
+      for(int vy=0; vy<bs; ++vy)
+      for(int vx=0; vx<bs; ++vx, ++vid)
+      {
+        const int fgx = (gx0+vx)*2, fgy = (gy0+vy)*2, fgz = (gz0+vz)*2;
+        float num = 0.f, den = 0.f;
+        for(int dz=0; dz<2; dz++)
+        for(int dy=0; dy<2; dy++)
+        for(int dx=0; dx<2; dx++)
+        {
+          const int x=fgx+dx, y=fgy+dy, z=fgz+dz;
+          CellFlags cf = sgF->getValueGen_(x,y,z);
+          if(cf & (CELL_SOLID|CELL_VOID|CELL_FIXED)) continue;
+          const float ri = sgSrc->getValueGen_(x,y,z);
+          const float Di = (float)sgD->getValueGen_(x,y,z);
+          const float wi = sqrtf(std::max(Di, 1e-20f));
+          num += wi * ri;
+          den += wi;
+        }
+        dst[vid] = (den > 1e-20f) ? (num / den) : 0.f;
+      }
+    }
+  }
+}
+
+/*-------------------------------------------------------------------------*/
+void MultiresSparseGrid::buildRelaxationBlocksFLIP_( int levelMg )
+{
+  _blocksRelax[levelMg].clear();
+  for(int bid = 0; bid < _nBlocks; bid++)
+  {
+    BlockInfo *bi = getBlockInfo(bid, levelMg);
+    if(!bi) continue;
+    if(!(bi->flags & BLK_EXISTS)) continue;
+    if(isRelaxationBlock(levelMg, bi))
+      _blocksRelax[levelMg].push_back(bid);
+  }
+}
+
+/*-------------------------------------------------------------------------*/
+void MultiresSparseGrid::restrictPressureMetaFLIP_( int levelMgCoarse )
+{
+  const int levelMgFine = levelMgCoarse - 1;
+
+  // 1. cell flags: restrict from fine level
+  //    fluid-priority: if any child cell is fluid, coarse cell is fluid
+  for(int level = 0; level < _nLevels; level++)
+  {
+    auto *sgFCoarse = getFlagsChannel(CH_CELL_FLAGS, level, levelMgCoarse);
+    auto *sgFFine   = getFlagsChannel(CH_CELL_FLAGS, level, levelMgFine);
+    if(!sgFCoarse) continue;
+    sgFCoarse->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+
+    for(LongInt bidL = 0; bidL < sgFCoarse->nBlocks(); bidL++)
+    {
+      const int bid = (int)bidL;
+      BlockInfo *bi = getBlockInfo(bid, levelMgCoarse);
+      if(!bi || bi->level != level) continue;
+
+      CellFlags *dst = sgFCoarse->getBlockDataPtr(bid, 1, 1); // alloc+zero
+      if(!dst) continue;
+
+      if(sgFFine)
+      {
+        int bx,by,bz;
+        _sg0->getBlockCoordsById(bid, bx, by, bz);
+        const int bsx = sgFCoarse->bsx();
+        const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
+
+        for(int vz=0, vid=0; vz<bsx; ++vz)
+        for(int vy=0; vy<bsx; ++vy)
+        for(int vx=0; vx<bsx; ++vx, ++vid)
+        {
+          // Sample 8 children from fine level (2x resolution mapping)
+          const int fgx = (gx0+vx)*2, fgy = (gy0+vy)*2, fgz = (gz0+vz)*2;
+          bool hasFluid=false, hasSolid=false, hasVoid=false;
+          for(int dz=0;dz<2;dz++)
+          for(int dy=0;dy<2;dy++)
+          for(int dx=0;dx<2;dx++)
+          {
+            CellFlags cf = sgFFine->getValueGen_(fgx+dx, fgy+dy, fgz+dz);
+            if(!(cf & (CELL_SOLID|CELL_VOID|CELL_FIXED))) hasFluid=true;
+            if(cf & CELL_SOLID) hasSolid=true;
+            if(cf & CELL_VOID)  hasVoid=true;
+          }
+          // Fluid priority for coarse solver
+          if(hasFluid) dst[vid] = 0;
+          else if(hasSolid) dst[vid] = CELL_SOLID;
+          else dst[vid] = CELL_VOID;
+        }
+      }
+      // else: fine not available, default to fluid (zero)
+
+      // Update block flags
+      bool blockHasFluid = false;
+      const int nvox = sgFCoarse->nVoxelsInBlock();
+      for(int i=0;i<nvox;i++)
+        if(!(dst[i] & (CELL_SOLID|CELL_VOID|CELL_FIXED))) { blockHasFluid=true; break; }
+
+      bi->flags |= BLK_EXISTS;
+      if(blockHasFluid) bi->flags &= ~BLK_NO_FLUID;
+      else              bi->flags |=  BLK_NO_FLUID;
+      bi->flags &= ~BLK_FIXED;
+    }
+  }
+
+  // 2. face area: restrict from fine level via averaging
+  for(int dir = 0; dir < 3; dir++)
+  {
+    for(int level = 0; level < _nLevels; level++)
+    {
+      auto *sgWCoarse = getFaceAreaChannel(dir, level, levelMgCoarse);
+      auto *sgWFine   = getFaceAreaChannel(dir, level, levelMgFine);
+      if(!sgWCoarse) continue;
+      sgWCoarse->prepareDataAccess(SBG::ACC_READ | SBG::ACC_WRITE);
+
+      for(LongInt bidL = 0; bidL < sgWCoarse->nBlocks(); bidL++)
+      {
+        const int bid = (int)bidL;
+        BlockInfo *bi = getBlockInfo(bid, levelMgCoarse);
+        if(!bi || bi->level != level) continue;
+
+        float *w = sgWCoarse->getBlockDataPtr(bid, 1, 0);
+        if(!w) continue;
+
+        if(sgWFine)
+        {
+          int bx,by,bz;
+          _sg0->getBlockCoordsById(bid, bx, by, bz);
+          const int bsx = sgWCoarse->bsx();
+          const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
+
+          for(int vz=0, vid=0; vz<bsx; ++vz)
+          for(int vy=0; vy<bsx; ++vy)
+          for(int vx=0; vx<bsx; ++vx, ++vid)
+          {
+            // Average 4 fine faces (tangential 2x2 sampling)
+            const int fgx = (gx0+vx)*2, fgy = (gy0+vy)*2, fgz = (gz0+vz)*2;
+            float sum = 0.f;
+            for(int j=0;j<2;j++)
+            for(int k=0;k<2;k++)
+            {
+              int fx=fgx, fy=fgy, fz=fgz;
+              if(dir==0) { fy+=j; fz+=k; }
+              if(dir==1) { fx+=j; fz+=k; }
+              if(dir==2) { fx+=j; fy+=k; }
+              sum += sgWFine->getValueGen_(fx, fy, fz);
+            }
+            w[vid] = sum * 0.25f;
+          }
+        }
+        else
+        {
+          // No fine data: default to 1.0
+          for(int i=0; i<sgWCoarse->nVoxelsInBlock(); i++) w[i]=1.0f;
+        }
+      }
+    }
+  }
+
+  // 3. diagonal: recompute from coarse face weights (+ set CELL_PARTIAL_SOLID/BLK_CUTS_SOLID)
+  computeDiagonalFLIP_(levelMgCoarse);
+
+  // 4. block lists
+  buildRelaxationBlocksFLIP_(levelMgCoarse);
+}
+
+/*-------------------------------------------------------------------------*/
+void MultiresSparseGrid::allocPressureChannelsFLIP_( int levelMgMax )
+{
+  // Work channels for PCG + V-cycle
+  const int chans[] = { CH_PRESSURE, CH_DIVERGENCE,
+                        CH_FLOAT_2, CH_FLOAT_3, CH_FLOAT_4,
+                        CH_FLOAT_6, CH_FLOAT_TMP_3 };
+
+  // 1. prepareDataAccess: allocate blockmap + blockpool for all MG levels
+  for(int ch : chans)
+    prepareDataAccess(ch);
+
+  // 2. Pre-touch: allocate block data for levelMg=0 only.
+  //    Coarse MG levels are allocated on-demand inside vCycle via
+  //    ensureWorkChannelBlocks_().
+  for(int ch : chans)
+  {
+    for(int level = 0; level < _nLevels; level++)
+    {
+      auto *sg = getFloatChannel(ch, level, 0);
+      if(!sg) continue;
+      for(LongInt bid = 0; bid < sg->nBlocks(); bid++)
+      {
+        BlockInfo *bi = getBlockInfo((int)bid, 0);
+        if(!bi || bi->level != level) continue;
+        sg->getBlockDataPtr((int)bid, 1, 1); // alloc + zero
+      }
+    }
+  }
+}
+
+/*-------------------------------------------------------------------------*/
+void MultiresSparseGrid::preparePressureSolveFLIP(
+    const FlipPressureCallbacks &cb, unsigned options )
+{
+  (void)options;
+  const int coarsest = _nLevels - 1;
+
+  // 1. Allocate all work channels
+  allocPressureChannelsFLIP_(coarsest);
+
+  // 2. Set level-0 cell flags, face weights, RHS from callbacks
+  preparePressureSolveFLIPLevel0_(cb);
+
+  // 3. Level-0 diagonal and block lists
+  computeDiagonalFLIP_(0);
+  buildRelaxationBlocksFLIP_(0);
+
+  // 4. Build coarser MG levels by restriction
+  for(int lMg = 1; lMg <= coarsest; lMg++)
+    restrictPressureMetaFLIP_(lMg);
+
+  // 5. Initialize per-level diagonal reference (used by dense-level smoother)
+  //    and adapt omega globally by sqrt(density ratio) for liquid stability.
+  memset(_mgDiagRef, 0, sizeof(_mgDiagRef));
+  for(int lMg = 0; lMg <= coarsest; lMg++)
+    computeMgDiagRef_(lMg);
+  {
+    float maxInvDiag = 0.f, minInvDiag = 1e30f;
+    for(int level = 0; level < _nLevels; level++) {
+      auto *sgD = getPSFloatChannel(CH_DIAGONAL, level, 0);
+      auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, 0);
+      if(!sgD || !sgF) continue;
+      for(int bid = 0; bid < _nBlocks; bid++) {
+        BlockInfo *bi = getBlockInfo(bid, 0);
+        if(!bi || bi->level != level || !(bi->flags & BLK_EXISTS)) continue;
+        PSFloat *d = sgD->getBlockDataPtr(bid);
+        CellFlags *f = sgF->getBlockDataPtr(bid);
+        if(!d || !f) continue;
+        for(int i = 0; i < sgD->nVoxelsInBlock(); i++) {
+          if(f[i] & (CELL_SOLID|CELL_VOID|CELL_FIXED)) continue;
+          float v = (float)d[i];
+          if(v > 1e-12f) {
+            if(v > maxInvDiag) maxInvDiag = v;
+            if(v < minInvDiag) minInvDiag = v;
+          }
+        }
+      }
+    }
+    if(maxInvDiag > 1e-12f && minInvDiag > 1e-12f) {
+      float ratio = maxInvDiag / minInvDiag;
+      _mgSmOmega = _mgSmOmegaDefault / sqrtf(std::max(ratio, 1.f));
+      _mgSmOmega = std::max(_mgSmOmega, 0.02f);
+      _mgSmOmega = std::min(_mgSmOmega, _mgSmOmegaDefault);
+    }
+  }
+}
+
+/*-------------------------------------------------------------------------*/
+void MultiresSparseGrid::solvePressureFLIPPCG_(
+    const FlipPressureSolveParams &sp,
+    int *outIters, float *outRelResidual )
+{
+  const int chX = CH_PRESSURE, chB = CH_DIVERGENCE,
+            chR = CH_FLOAT_2, chZ = CH_FLOAT_3,
+            chD = CH_FLOAT_4, chQ = CH_FLOAT_6,
+            chTmp = CH_FLOAT_TMP_3;
+
+  // r = b (x=0)
+  copyChannel(chB, chR, 1, -1, 0);
+
+  // |b|^2
+  long double bNormSq = 0;
+  {
+    auto *sg = getFloatChannel(chR, 0);
+    for(int bid = 0; bid < sg->nBlocks(); bid++)
+    {
+      float *d = sg->getBlockDataPtr(bid);
+      if(!d) continue;
+      for(int i = 0; i < sg->nVoxelsInBlock(); i++)
+        bNormSq += (double)d[i]*(double)d[i];
+    }
+  }
+  if(bNormSq <= 1e-30) { *outIters = 0; *outRelResidual = 0; return; }
+
+  // z = M^{-1} r  (V-cycle preconditioner)
+  zeroChannelInPlace(this, chZ, 0);
+  vCycle(0, chZ, chR, chQ, chTmp, sp.nPre, sp.nPost, sp.nCoarse);
+
+  // d = z
+  copyChannel(chZ, chD, 1, -1, 0);
+
+  // rho = r.z
+  long double rho = 0;
+  {
+    auto *sgR = getFloatChannel(chR, 0);
+    auto *sgZ = getFloatChannel(chZ, 0);
+    for(int bid = 0; bid < sgR->nBlocks(); bid++)
+    {
+      float *dr = sgR->getBlockDataPtr(bid);
+      float *dz = sgZ->getBlockDataPtr(bid);
+      if(!dr||!dz) continue;
+      for(int i = 0; i < sgR->nVoxelsInBlock(); i++)
+        rho += (double)dr[i]*(double)dz[i];
+    }
+  }
+
+  const double tolSq = (double)sp.tol*(double)sp.tol;
+  int convergedIter = -1;
+
+  for(int iter = 0; iter < sp.maxIter; iter++)
+  {
+    // q = A*d
+    multiplyLaplacianMatrixOpt(0, 0, chD, CH_NULL, 0.0f, chQ, nullptr, nullptr);
+
+    // alpha = rho / (d.q)
+    long double dq = 0;
+    {
+      auto *sgD = getFloatChannel(chD, 0);
+      auto *sgQ = getFloatChannel(chQ, 0);
+      for(int bid = 0; bid < sgD->nBlocks(); bid++)
+      {
+        float *dd = sgD->getBlockDataPtr(bid);
+        float *dq_ = sgQ->getBlockDataPtr(bid);
+        if(!dd||!dq_) continue;
+        for(int i = 0; i < sgD->nVoxelsInBlock(); i++)
+          dq += (double)dd[i]*(double)dq_[i];
+      }
+    }
+    if(!(dq > 1e-30) || !(rho > 1e-30) ||
+       !std::isfinite((double)dq) || !std::isfinite((double)rho)) break;
+    const double alphaD = (double)rho / (double)dq;
+    if(!std::isfinite(alphaD)) break;
+    const float alpha = (float)alphaD;
+
+    // x += alpha*d, r -= alpha*q
+    long double rNormSq = 0;
+    {
+      auto *sgX = getFloatChannel(chX, 0);
+      auto *sgR = getFloatChannel(chR, 0);
+      auto *sgD = getFloatChannel(chD, 0);
+      auto *sgQ = getFloatChannel(chQ, 0);
+      for(int bid = 0; bid < sgX->nBlocks(); bid++)
+      {
+        float *dx = sgX->getBlockDataPtr(bid);
+        float *dr = sgR->getBlockDataPtr(bid);
+        float *dd = sgD->getBlockDataPtr(bid);
+        float *dq_ = sgQ->getBlockDataPtr(bid);
+        if(!dx||!dr) continue;
+        for(int i = 0; i < sgX->nVoxelsInBlock(); i++)
+        {
+          if(dd)  dx[i] += alpha * dd[i];
+          if(dq_) dr[i] -= alpha * dq_[i];
+          rNormSq += (double)dr[i]*(double)dr[i];
+        }
+      }
+    }
+    if(rNormSq <= tolSq * bNormSq)
+    { convergedIter = iter+1; break; }
+
+    // z = M^{-1} r  (V-cycle preconditioner)
+    zeroChannelInPlace(this, chZ, 0);
+    vCycle(0, chZ, chR, chQ, chTmp, sp.nPre, sp.nPost, sp.nCoarse);
+
+    // rhoNew = r.z
+    long double rhoNew = 0;
+    {
+      auto *sgR = getFloatChannel(chR, 0);
+      auto *sgZ = getFloatChannel(chZ, 0);
+      for(int bid = 0; bid < sgR->nBlocks(); bid++)
+      {
+        float *dr = sgR->getBlockDataPtr(bid);
+        float *dz = sgZ->getBlockDataPtr(bid);
+        if(!dr||!dz) continue;
+        for(int i = 0; i < sgR->nVoxelsInBlock(); i++)
+          rhoNew += (double)dr[i]*(double)dz[i];
+      }
+    }
+    if(!(rhoNew > 1e-30) || !std::isfinite((double)rhoNew)) break;
+    const double betaD = (double)rhoNew / (double)rho;
+    if(!std::isfinite(betaD)) break;
+    const float beta = (float)betaD;
+
+    // d = z + beta*d
+    {
+      auto *sgZ = getFloatChannel(chZ, 0);
+      auto *sgD = getFloatChannel(chD, 0);
+      for(int bid = 0; bid < sgZ->nBlocks(); bid++)
+      {
+        float *dz = sgZ->getBlockDataPtr(bid);
+        float *dd = sgD->getBlockDataPtr(bid);
+        if(!dz||!dd) continue;
+        for(int i = 0; i < sgZ->nVoxelsInBlock(); i++)
+          dd[i] = dz[i] + beta*dd[i];
+      }
+    }
+    rho = rhoNew;
+  }
+
+  // final residual
+  long double finalRes = 0;
+  {
+    auto *sg = getFloatChannel(chR, 0);
+    for(int bid = 0; bid < sg->nBlocks(); bid++)
+    {
+      float *d = sg->getBlockDataPtr(bid);
+      if(!d) continue;
+      for(int i = 0; i < sg->nVoxelsInBlock(); i++)
+        finalRes += (double)d[i]*(double)d[i];
+    }
+  }
+  float relRes = (float)sqrt((double)finalRes/(double)bNormSq);
+
+  if(convergedIter > 0)
+    { TRCP(("  MG-PCG converged in %d iter  |r|/|b|=%.2e\n",convergedIter,relRes)); }
+  else
+    { TRCP(("  MG-PCG: maxIter=%d reached  |r|/|b|=%.2e\n",sp.maxIter,relRes)); }
+
+  *outIters = convergedIter > 0 ? convergedIter : sp.maxIter;
+  *outRelResidual = relRes;
+}
+
+/*-------------------------------------------------------------------------*/
+int MultiresSparseGrid::solvePressureFLIP(
+    const FlipPressureSolveParams &params,
+    float *outRelResidual )
+{
+  int iters = 0;
+  float relRes = 0;
+  solvePressureFLIPPCG_(params, &iters, &relRes);
+  if(outRelResidual) *outRelResidual = relRes;
+  return iters;
 }
 
 } // namespace MSBG
