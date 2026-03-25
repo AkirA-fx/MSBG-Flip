@@ -160,6 +160,46 @@ float interpComp( SBG::SparseGrid<Vec3Float> *sg,
     return sum;
 }
 
+// Valid-weight trilinear interpolation for advection RK2.
+// Returns interpolated velocity at (px,py,pz) using only grid points
+// that have block data allocated AND fluid support in sgMass.
+// *validWeightOut receives the total valid interpolation weight (0..1).
+float interpCompValidFine( SBG::SparseGrid<Vec3Float> *sgVel,
+                           SBG::SparseGrid<float> *sgMass,
+                           float px,float py,float pz,
+                           float ox,float oy,float oz,int comp,
+                           float massEps, float *validWeightOut )
+{
+    const float gx=px-ox,gy=py-oy,gz=pz-oz;
+    const int ix0=(int)floorf(gx),iy0=(int)floorf(gy),iz0=(int)floorf(gz);
+    const float fx=gx-ix0,fy=gy-iy0,fz=gz-iz0;
+
+    float sum=0.f, wsum=0.f;
+    for(int dz=0;dz<=1;dz++) for(int dy=0;dy<=1;dy++) for(int dx=0;dx<=1;dx++)
+    {
+        const float w=(dx?fx:1.f-fx)*(dy?fy:1.f-fy)*(dz?fz:1.f-fz);
+        const int ix=ix0+dx, iy=iy0+dy, iz=iz0+dz;
+        // Check block data exists
+        int bid,vid;
+        if(!getBidVidV(sgVel,ix,iy,iz,bid,vid)) continue;
+        Vec3Float *d=sgVel->getBlockDataPtr(bid);
+        if(!d) continue;
+        // Check fluid support: at least one adjacent cell has mass
+        bool hasSupport = true;
+        if(sgMass) {
+            if(comp==0) hasSupport = isFluid(sgMass,ix-1,iy,iz,massEps)||isFluid(sgMass,ix,iy,iz,massEps);
+            else if(comp==1) hasSupport = isFluid(sgMass,ix,iy-1,iz,massEps)||isFluid(sgMass,ix,iy,iz,massEps);
+            else hasSupport = isFluid(sgMass,ix,iy,iz-1,massEps)||isFluid(sgMass,ix,iy,iz,massEps);
+        }
+        if(!hasSupport) continue;
+        float val=(comp==0)?d[vid].x:(comp==1?d[vid].y:d[vid].z);
+        sum  += w*val;
+        wsum += w;
+    }
+    if(validWeightOut) *validWeightOut = wsum;
+    return (wsum>1e-6f) ? (sum/wsum) : 0.f;
+}
+
 // CSR SpMV: q = A * x
 void csrSpmv(const PressureSystem &A, const float *x, float *q)
 {
@@ -1382,7 +1422,9 @@ void FlipSimulation::gridToParticle()
 
 void FlipSimulation::advectParticles(float dt)
 {
-    auto *sgVel = grid_.vel;
+    auto *sgVel  = grid_.vel;
+    auto *sgMass = grid_.mass;
+    const float MASS_EPS = cfg_.massEps;
     const int sx=grid_.sx, sy=grid_.sy, sz=grid_.sz;
     const float eps=1e-4f,xMax=(float)sx-eps,yMax=(float)sy-eps,zMax=(float)sz-eps;
     const size_t np=state_.particles.size();
@@ -1401,11 +1443,28 @@ void FlipSimulation::advectParticles(float dt)
               if(!std::isfinite(p.pos.y))p.pos.y=0.5f;
               if(!std::isfinite(p.pos.z))p.pos.z=0.5f; continue; }
 
-            // Forward Euler (1st-order)
-            // Note: RK2 midpoint was implemented but causes PCG regression
-            // (interpVec3MSBG grid read during advection interferes with
-            //  pressure channel state). Needs investigation.
-            p.pos.x+=dt*p.vel.x; p.pos.y+=dt*p.vel.y; p.pos.z+=dt*p.vel.z;
+            // RK2 Midpoint: k1 = particle velocity (already pressure-projected
+            // via G2P), k2 = grid velocity at midpoint with valid-weight fallback.
+            // k1 uses p.vel directly (avoids sparse grid empty-block issues).
+            const Vec3Float k1 = p.vel;
+            const Vec3Float mid(
+                std::clamp(p.pos.x + 0.5f*dt*k1.x, 0.f, xMax),
+                std::clamp(p.pos.y + 0.5f*dt*k1.y, 0.f, yMax),
+                std::clamp(p.pos.z + 0.5f*dt*k1.z, 0.f, zMax));
+
+            // Sample grid velocity at midpoint; fall back to k1 where no data
+            float wu=0.f,wv=0.f,ww=0.f;
+            Vec3Float k2(
+                interpCompValidFine(sgVel,sgMass,mid.x,mid.y,mid.z,0.f,0.5f,0.5f,0,MASS_EPS,&wu),
+                interpCompValidFine(sgVel,sgMass,mid.x,mid.y,mid.z,0.5f,0.f,0.5f,1,MASS_EPS,&wv),
+                interpCompValidFine(sgVel,sgMass,mid.x,mid.y,mid.z,0.5f,0.5f,0.f,2,MASS_EPS,&ww));
+            if(wu<0.01f) k2.x=k1.x;
+            if(wv<0.01f) k2.y=k1.y;
+            if(ww<0.01f) k2.z=k1.z;
+
+            p.pos.x += dt*k2.x;
+            p.pos.y += dt*k2.y;
+            p.pos.z += dt*k2.z;
 
             // Boundary clamp + free-slip BC
             if(p.pos.x<0.f) {p.pos.x=0.f;  p.vel.x=std::max(p.vel.x,0.f);}

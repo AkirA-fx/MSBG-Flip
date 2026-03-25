@@ -1116,8 +1116,8 @@ void MultiresSparseGrid::IprocessBlockLaplacian(
 
     const VecNpfs HR(1.f/h);
 
-    const VecNpfs omegaBase(_mgSmOmega);
-    // omega/oneMinusOmega are computed per-cell below for density scaling
+    const VecNpfs omega(_mgSmOmega),
+	        oneMinusOmega = 1.0f - omega;
 
     #if defined( RELAX_BLOCK_GAUSS_SEIDEL_RB )
     for( int pass_red_black=0; pass_red_black < (opmode & LAPL_RELAX ? 2:1); pass_red_black++)
@@ -1322,11 +1322,7 @@ void MultiresSparseGrid::IprocessBlockLaplacian(
 	  else
 	  {
 	    B.load_a(dataB+vid);
-	    {
-	      VecNpfs omega = omegaBase;
-	      VecNpfs oneMinusOmega = 1.0f - omega;
-	      Y = select( D!=0.0f, omega*(B+S)*D + oneMinusOmega * F0, F0 );
-	    }
+	    Y = select( D!=0.0f, omega*(B+S)*D + oneMinusOmega * F0, F0 );
 
 	    #ifdef ADAPTIVE_BLOCK_LOCAL_RELAX
 	    //UT_ASSERT0( !vany(D==0.0f) );
