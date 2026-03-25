@@ -1322,6 +1322,7 @@ Vec3Float FlipSimulation::interpVec3MSBG(SBG::SparseGrid<Vec3Float> *sg,
 
     auto *sgLev=msbg->getVecChannel(chanId,level,0);
     if(!sgLev) sgLev=sg;
+    auto *sgDist=msbg->getDistFineCoarseChannel(level);
 
     auto interpCoarse=[&](const SampleInfo &s,int comp)->float{
         const float scale=1.f/(float)(1<<level);
@@ -1341,7 +1342,28 @@ Vec3Float FlipSimulation::interpVec3MSBG(SBG::SparseGrid<Vec3Float> *sg,
         return sum;
     };
 
-    return Vec3Float(interpCoarse(su,0),interpCoarse(sv,1),interpCoarse(sw,2));
+    // Coarse-fine blending using distFineCoarse (matches MSBG core approach)
+    auto interpBlended=[&](const SampleInfo &s,int comp)->float{
+        const float fineVal   = interpFine(s,comp);
+        const float coarseVal = interpCoarse(s,comp);
+
+        if(!sgDist) return coarseVal;
+
+        const float scale=1.f/(float)(1<<level);
+        float pos[3] = { s.gx*scale, s.gy*scale, s.gz*scale };
+        const float dist = sgDist->interpolateToFloat<SBG::IP_LINEAR>(
+            pos, SBG::OPT_IPBC_NEUMAN) / 1024.0f;
+
+        const int stenWidth = 2;
+        const float alphaFine = (float)MtLinstep(
+            (stenWidth/2.f - 0.f) * MT_SQRT3F * 1.01f,
+            0.99f * (msbg->dTransRes() + 2.f) / MT_SQRT3F,
+            dist);
+
+        return alphaFine*fineVal + (1.f-alphaFine)*coarseVal;
+    };
+
+    return Vec3Float(interpBlended(su,0),interpBlended(sv,1),interpBlended(sw,2));
 }
 
 float FlipSimulation::interpCompMSBG(SBG::SparseGrid<Vec3Float> *sg,
@@ -1376,12 +1398,20 @@ float FlipSimulation::interpCompMSBG(SBG::SparseGrid<Vec3Float> *sg,
     auto *sgLev=msbg->getVecChannel(chanId,level,0);
     if(!sgLev) sgLev=sg;
 
+    auto interpFineComp=[&]()->float{
+        float s=0.f;
+        for(int dz=0;dz<=1;dz++) for(int dy=0;dy<=1;dy++) for(int dx=0;dx<=1;dx++)
+            s+=(dx?fx:1.f-fx)*(dy?fy:1.f-fy)*(dz?fz:1.f-fz)
+               *getVC(sg,ix0+dx,iy0+dy,iz0+dz,comp);
+        return s;
+    };
+
     const float scale=1.f/(float)(1<<level);
     const float cgx=gx*scale, cgy=gy*scale, cgz=gz*scale;
     const int cix0=(int)floorf(cgx), ciy0=(int)floorf(cgy), ciz0=(int)floorf(cgz);
     const float cfx=cgx-cix0, cfy=cgy-ciy0, cfz=cgz-ciz0;
 
-    float sum=0.f;
+    float coarseVal=0.f;
     for(int dz=0;dz<=1;dz++) for(int dy=0;dy<=1;dy++) for(int dx=0;dx<=1;dx++)
     {
         int ix2=cix0+dx, iy2=ciy0+dy, iz2=ciz0+dz;
@@ -1392,9 +1422,24 @@ float FlipSimulation::interpCompMSBG(SBG::SparseGrid<Vec3Float> *sg,
             Vec3Float *d=sgLev->getBlockDataPtr(b2);
             if(d) val=(comp==0?d[v2].x:(comp==1?d[v2].y:d[v2].z));
         }
-        sum+=(dx?cfx:1.f-cfx)*(dy?cfy:1.f-cfy)*(dz?cfz:1.f-cfz)*val;
+        coarseVal+=(dx?cfx:1.f-cfx)*(dy?cfy:1.f-cfy)*(dz?cfz:1.f-cfz)*val;
     }
-    return sum;
+
+    // Coarse-fine blending using distFineCoarse (matches MSBG core)
+    auto *sgDist=msbg->getDistFineCoarseChannel(level);
+    if(!sgDist) return coarseVal;
+
+    float pos[3] = { cgx, cgy, cgz };
+    const float dist = sgDist->interpolateToFloat<SBG::IP_LINEAR>(
+        pos, SBG::OPT_IPBC_NEUMAN) / 1024.0f;
+
+    const int stenWidth = 2;
+    const float alphaFine = (float)MtLinstep(
+        (stenWidth/2.f - 0.f) * MT_SQRT3F * 1.01f,
+        0.99f * (msbg->dTransRes() + 2.f) / MT_SQRT3F,
+        dist);
+
+    return alphaFine*interpFineComp() + (1.f-alphaFine)*coarseVal;
 }
 
 void FlipSimulation::gridToParticle()
