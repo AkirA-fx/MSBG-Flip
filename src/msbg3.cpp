@@ -2736,20 +2736,19 @@ void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
   }
   else
   {
-    // Coarser MG levels: exact 6-face weight sum (matches fine-level approach)
+    // Coarser MG levels: approximate 6-face weight sum
+    // Note: exact getValueGen_ approach was tested but empirically the
+    // simple 2*(fu+fv+fw) approximation works better with the current
+    // V-cycle structure due to face weight averaging in restriction.
     for(int level = levelMg; level < _nLevels; level++)
     {
-      auto *sgF  = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
-      auto *sgD  = getPSFloatChannel(CH_DIAGONAL, level, levelMg);
+      auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
+      auto *sgD = getPSFloatChannel(CH_DIAGONAL, level, levelMg);
       auto *sgFU = getFaceAreaChannel(0, level, levelMg);
       auto *sgFV = getFaceAreaChannel(1, level, levelMg);
       auto *sgFW = getFaceAreaChannel(2, level, levelMg);
       if(!sgF || !sgD) continue;
       if(!sgFU || !sgFV || !sgFW) continue;
-
-      sgFU->prepareDataAccess(SBG::ACC_READ);
-      sgFV->prepareDataAccess(SBG::ACC_READ);
-      sgFW->prepareDataAccess(SBG::ACC_READ);
 
       for(int bid = 0; bid < _nBlocks; bid++)
       {
@@ -2761,11 +2760,12 @@ void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
         PSFloat   *d = sgD->getBlockDataPtr(bid);
         if(!f || !d) continue;
 
-        int bx,by,bz;
-        _sg0->getBlockCoordsById(bid, bx, by, bz);
-        const int bsx = sgF->bsx();
-        const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
+        float *fu = sgFU->getBlockDataPtr(bid);
+        float *fv = sgFV->getBlockDataPtr(bid);
+        float *fw = sgFW->getBlockDataPtr(bid);
+        if(!fu||!fv||!fw) continue;
 
+        const int bsx = sgF->bsx();
         for(int vz=0, vid=0; vz<bsx; ++vz)
         for(int vy=0; vy<bsx; ++vy)
         for(int vx=0; vx<bsx; ++vx, ++vid)
@@ -2773,14 +2773,8 @@ void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
           if(f[vid] & (CELL_SOLID | CELL_VOID | CELL_FIXED))
           { d[vid] = 0; continue; }
 
-          const int gx = gx0+vx, gy = gy0+vy, gz = gz0+vz;
-          const float sum =
-              sgFU->getValueGen_(gx,   gy, gz)
-            + sgFU->getValueGen_(gx+1, gy, gz)
-            + sgFV->getValueGen_(gx, gy,   gz)
-            + sgFV->getValueGen_(gx, gy+1, gz)
-            + sgFW->getValueGen_(gx, gy, gz)
-            + sgFW->getValueGen_(gx, gy, gz+1);
+          float sum = fu[vid] + fv[vid] + fw[vid];
+          sum *= 2.0f;
           d[vid] = (sum > 1e-12f) ? (PSFloat)(1.f / sum) : (PSFloat)0;
         }
       }

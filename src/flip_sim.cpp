@@ -1382,27 +1382,38 @@ void FlipSimulation::gridToParticle()
 
 void FlipSimulation::advectParticles(float dt)
 {
+    auto *sgVel = grid_.vel;
     const int sx=grid_.sx, sy=grid_.sy, sz=grid_.sz;
     const float eps=1e-4f,xMax=(float)sx-eps,yMax=(float)sy-eps,zMax=(float)sz-eps;
     const size_t np=state_.particles.size();
+
     tbb::parallel_for(tbb::blocked_range<size_t>(0,np),
         [&](const tbb::blocked_range<size_t> &range){
         for(size_t i=range.begin();i<range.end();i++)
         {
             FlipParticle &p=state_.particles[i];
             if(!finite3(p.pos.x,p.pos.y,p.pos.z)||!finite3(p.vel.x,p.vel.y,p.vel.z))
-            { p.vel.x=p.vel.y=p.vel.z=0.f; p.pos.x=std::clamp(p.pos.x,0.f,xMax);
-              p.pos.y=std::clamp(p.pos.y,0.f,yMax); p.pos.z=std::clamp(p.pos.z,0.f,zMax);
+            { p.vel.x=p.vel.y=p.vel.z=0.f;
+              p.pos.x=std::clamp(p.pos.x,0.f,xMax);
+              p.pos.y=std::clamp(p.pos.y,0.f,yMax);
+              p.pos.z=std::clamp(p.pos.z,0.f,zMax);
               if(!std::isfinite(p.pos.x))p.pos.x=0.5f;
               if(!std::isfinite(p.pos.y))p.pos.y=0.5f;
               if(!std::isfinite(p.pos.z))p.pos.z=0.5f; continue; }
+
+            // Forward Euler (1st-order)
+            // Note: RK2 midpoint was implemented but causes PCG regression
+            // (interpVec3MSBG grid read during advection interferes with
+            //  pressure channel state). Needs investigation.
             p.pos.x+=dt*p.vel.x; p.pos.y+=dt*p.vel.y; p.pos.z+=dt*p.vel.z;
-            if(p.pos.x<0.f) {p.pos.x=0.f; p.vel.x=std::max(p.vel.x,0.f);}
-            if(p.pos.x>xMax){p.pos.x=xMax;p.vel.x=std::min(p.vel.x,0.f);}
-            if(p.pos.y<0.f) {p.pos.y=0.f; p.vel.y=std::max(p.vel.y,0.f);}
-            if(p.pos.y>yMax){p.pos.y=yMax;p.vel.y=std::min(p.vel.y,0.f);}
-            if(p.pos.z<0.f) {p.pos.z=0.f; p.vel.z=std::max(p.vel.z,0.f);}
-            if(p.pos.z>zMax){p.pos.z=zMax;p.vel.z=std::min(p.vel.z,0.f);}
+
+            // Boundary clamp + free-slip BC
+            if(p.pos.x<0.f) {p.pos.x=0.f;  p.vel.x=std::max(p.vel.x,0.f);}
+            if(p.pos.x>xMax){p.pos.x=xMax; p.vel.x=std::min(p.vel.x,0.f);}
+            if(p.pos.y<0.f) {p.pos.y=0.f;  p.vel.y=std::max(p.vel.y,0.f);}
+            if(p.pos.y>yMax){p.pos.y=yMax; p.vel.y=std::min(p.vel.y,0.f);}
+            if(p.pos.z<0.f) {p.pos.z=0.f;  p.vel.z=std::max(p.vel.z,0.f);}
+            if(p.pos.z>zMax){p.pos.z=zMax; p.vel.z=std::min(p.vel.z,0.f);}
         }
     });
 }
