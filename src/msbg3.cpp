@@ -166,7 +166,7 @@ void procNeighMixedRes2(
 static inline 
 void ImultiplyLaplacianMatrixProcessSliceDenseLevel(
     		        int iIter, int pass_red_black,
-    			int z0,  // z-slice to process			
+    			int z0,  // z-slice to process
 			int doJacobi,
 			int doReverseOrder,
     			int doBoundZoneOnly,
@@ -183,6 +183,7 @@ void ImultiplyLaplacianMatrixProcessSliceDenseLevel(
 			PSFloat *dataDstY,
 			bool doBypassCache,
 			bool usePhysicalAirVelocity,
+			float diagRefDense=0.f,
 			UtPerfStats *pfs=NULL
 			)
 {
@@ -1115,8 +1116,8 @@ void MultiresSparseGrid::IprocessBlockLaplacian(
 
     const VecNpfs HR(1.f/h);
 
-    const VecNpfs omega(_mgSmOmega),
-	        oneMinusOmega = 1.0f - omega;
+    const VecNpfs omegaBase(_mgSmOmega);
+    // omega/oneMinusOmega are computed per-cell below for density scaling
 
     #if defined( RELAX_BLOCK_GAUSS_SEIDEL_RB )
     for( int pass_red_black=0; pass_red_black < (opmode & LAPL_RELAX ? 2:1); pass_red_black++)
@@ -1321,7 +1322,11 @@ void MultiresSparseGrid::IprocessBlockLaplacian(
 	  else
 	  {
 	    B.load_a(dataB+vid);
-	    Y = select( D!=0.0f, omega*(B+S)*D + oneMinusOmega * F0, F0 );
+	    {
+	      VecNpfs omega = omegaBase;
+	      VecNpfs oneMinusOmega = 1.0f - omega;
+	      Y = select( D!=0.0f, omega*(B+S)*D + oneMinusOmega * F0, F0 );
+	    }
 
 	    #ifdef ADAPTIVE_BLOCK_LOCAL_RELAX
 	    //UT_ASSERT0( !vany(D==0.0f) );
@@ -2116,16 +2121,17 @@ xxxx   int nThreads = MAX(nMaxThreads/4,4); // TODO: optimze dependent on proble
 	#endif
 
 	ImultiplyLaplacianMatrixProcessSliceDenseLevel( iIter, pass_red_black,
-	    z, 
+	    z,
 	    doJacobi, doReverseOrder, doBoundZoneOnly, doCalcResidual,
 	    sx,sy,sz, yStrid,zStrid,
 	    h, omegaAct,
-	    sg, 
+	    sg,
 	    dataFlags, dataX, dataB, dataD,
 	    dataFaceArea,
 	    dataDstY,
 	    doBypassCache,
-	    false
+	    false,
+	    _mgDiagRef[levelMg]
 	    #ifdef MSBG_PERF_STATS
 	    ,&perfstats[tid]
 	    #endif
@@ -2583,6 +2589,11 @@ void MultiresSparseGrid::preparePressureSolveFLIPLevel0_(
 /*-------------------------------------------------------------------------*/
 void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
 {
+  // For levelMg > 0 (coarser MG levels), use simple face-weight sum.
+  // For levelMg = 0 (fine level with mixed-resolution blocks), use
+  // matrix-vector product to ensure diagonal matches the actual stencil.
+
+  // ---- Step 1: Set cell flags (CELL_PARTIAL_SOLID, BLK_CUTS_SOLID) ----
   for(int level = levelMg; level < _nLevels; level++)
   {
     auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
@@ -2609,48 +2620,48 @@ void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
       int bx,by,bz;
       _sg0->getBlockCoordsById(bid, bx, by, bz);
       const int bsx = sgF->bsx();
-      const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
 
-      // Clear stale flags before re-evaluation
+      // Check for mixed-res neighbors
+      bool hasMixedResNeighbor = false;
+      {
+        const int offs[6][3] = {{-1,0,0},{1,0,0},{0,-1,0},{0,1,0},{0,0,-1},{0,0,1}};
+        for(int fi=0; fi<6; fi++)
+        {
+          int bx2=bx+offs[fi][0], by2=by+offs[fi][1], bz2=bz+offs[fi][2];
+          if(!sgF->blockCoordsInRange(bx2,by2,bz2)) continue;
+          int bid2 = sgF->getBlockIndex(bx2,by2,bz2);
+          BlockInfo *bi2 = getBlockInfo(bid2, levelMg);
+          if(bi2 && bi2->level != level) { hasMixedResNeighbor = true; break; }
+        }
+      }
+
       bi->flags &= ~BLK_CUTS_SOLID;
       bool blockHasVariableCoeff = false;
-      const float eps = 1e-4f;
 
       for(int vz=0, vid=0; vz<bsx; ++vz)
       for(int vy=0; vy<bsx; ++vy)
       for(int vx=0; vx<bsx; ++vx, ++vid)
       {
-        // Clear stale CELL_PARTIAL_SOLID before re-evaluation
         f[vid] &= ~CELL_PARTIAL_SOLID;
 
         if(f[vid] & (CELL_SOLID | CELL_VOID | CELL_FIXED))
+        { d[vid] = 0; continue; }
+
+        // Set initial diagonal to 1/6 (will be corrected for levelMg=0)
+        d[vid] = (PSFloat)(1.f / 6.f);
+
+        // For FLIP 2-phase: face weights are density-dependent (not area
+        // fractions), so nearly ALL fluid cells have non-unit coefficients.
+        // Always flag as variable to ensure processBlockLaplacian uses
+        // the weighted stencil path (W1*F1 + ...) instead of the
+        // uniform path (F1 + F2 + ...).
+        if(hasFaceArea)
         {
-          d[vid] = 0;
-          continue;
+          f[vid] |= CELL_PARTIAL_SOLID;
+          blockHasVariableCoeff = true;
         }
-
-        if(!hasFaceArea)
-        {
-          d[vid] = (PSFloat)(1.f / 6.f);
-          continue;
-        }
-
-        const int gx=gx0+vx, gy=gy0+vy, gz=gz0+vz;
-        // 6 face coefficients surrounding this cell
-        const float wXm = sgFU->getValueGen_(gx,   gy, gz);  // x-left
-        const float wXp = sgFU->getValueGen_(gx+1, gy, gz);  // x-right
-        const float wYm = sgFV->getValueGen_(gx, gy,   gz);  // y-bottom
-        const float wYp = sgFV->getValueGen_(gx, gy+1, gz);  // y-top
-        const float wZm = sgFW->getValueGen_(gx, gy, gz);    // z-back
-        const float wZp = sgFW->getValueGen_(gx, gy, gz+1);  // z-front
-
-        const float sum = wXm + wXp + wYm + wYp + wZm + wZp;
-        d[vid] = (sum > 1e-12f) ? (PSFloat)(1.f / sum) : (PSFloat)0;
-
-        // Mark variable face coefficients for processBlockLaplacian
-        if(fabsf(wXm-1.f)>eps || fabsf(wXp-1.f)>eps ||
-           fabsf(wYm-1.f)>eps || fabsf(wYp-1.f)>eps ||
-           fabsf(wZm-1.f)>eps || fabsf(wZp-1.f)>eps)
+        else if(hasMixedResNeighbor &&
+                (vx==0 || vx==bsx-1 || vy==0 || vy==bsx-1 || vz==0 || vz==bsx-1))
         {
           f[vid] |= CELL_PARTIAL_SOLID;
           blockHasVariableCoeff = true;
@@ -2658,6 +2669,207 @@ void MultiresSparseGrid::computeDiagonalFLIP_( int levelMg )
       }
 
       if(blockHasVariableCoeff) bi->flags |= BLK_CUTS_SOLID;
+    }
+  }
+
+  // ---- Step 2: Compute correct diagonal from face weight sum ----
+  if(levelMg == 0)
+  {
+    // Direct diagonal: sum of 6 face weights per cell.
+    // For staggered MAC grid, face weight at cell (gx,gy,gz) is:
+    //   xLeft  = FU(gx,   gy, gz)    xRight = FU(gx+1, gy, gz)
+    //   yBot   = FV(gx, gy,   gz)    yTop   = FV(gx, gy+1, gz)
+    //   zBack  = FW(gx, gy, gz)      zFront = FW(gx, gy, gz+1)
+    // getValueGen_ returns _emptyValue (0) for out-of-range coords.
+
+    for(int level = 0; level < _nLevels; level++)
+    {
+      auto *sgD  = getPSFloatChannel(CH_DIAGONAL, level, 0);
+      auto *sgF  = getFlagsChannel(CH_CELL_FLAGS, level, 0);
+      auto *sgFU = getFaceAreaChannel(0, level, 0);
+      auto *sgFV = getFaceAreaChannel(1, level, 0);
+      auto *sgFW = getFaceAreaChannel(2, level, 0);
+      if(!sgD || !sgF) continue;
+      if(!sgFU || !sgFV || !sgFW) continue;
+
+      sgFU->prepareDataAccess(SBG::ACC_READ);
+      sgFV->prepareDataAccess(SBG::ACC_READ);
+      sgFW->prepareDataAccess(SBG::ACC_READ);
+
+      for(int bid = 0; bid < _nBlocks; bid++)
+      {
+        BlockInfo *bi = getBlockInfo(bid, 0);
+        if(!bi || bi->level != level) continue;
+        if(!(bi->flags & BLK_EXISTS)) continue;
+
+        PSFloat   *d = sgD->getBlockDataPtr(bid);
+        CellFlags *f = sgF->getBlockDataPtr(bid);
+        if(!d || !f) continue;
+
+        int bx,by,bz;
+        _sg0->getBlockCoordsById(bid, bx, by, bz);
+        const int bsx = sgF->bsx();
+        const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
+
+        for(int vz=0, vid=0; vz<bsx; ++vz)
+        for(int vy=0; vy<bsx; ++vy)
+        for(int vx=0; vx<bsx; ++vx, ++vid)
+        {
+          if(f[vid] & (CELL_SOLID | CELL_VOID | CELL_FIXED))
+          { d[vid] = 0; continue; }
+
+          const int gx = gx0+vx, gy = gy0+vy, gz = gz0+vz;
+
+          // Sum of 6 face weights (MAC staggered: left face stored at cell pos)
+          float sum = sgFU->getValueGen_(gx,   gy, gz)     // x-left
+                    + sgFU->getValueGen_(gx+1, gy, gz)     // x-right
+                    + sgFV->getValueGen_(gx, gy,   gz)     // y-bottom
+                    + sgFV->getValueGen_(gx, gy+1, gz)     // y-top
+                    + sgFW->getValueGen_(gx, gy, gz)       // z-back
+                    + sgFW->getValueGen_(gx, gy, gz+1);    // z-front
+
+          d[vid] = (sum > 1e-12f) ? (PSFloat)(1.f / sum) : (PSFloat)0;
+        }
+      }
+    }
+
+  }
+  else
+  {
+    // Coarser MG levels: exact 6-face weight sum (matches fine-level approach)
+    for(int level = levelMg; level < _nLevels; level++)
+    {
+      auto *sgF  = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
+      auto *sgD  = getPSFloatChannel(CH_DIAGONAL, level, levelMg);
+      auto *sgFU = getFaceAreaChannel(0, level, levelMg);
+      auto *sgFV = getFaceAreaChannel(1, level, levelMg);
+      auto *sgFW = getFaceAreaChannel(2, level, levelMg);
+      if(!sgF || !sgD) continue;
+      if(!sgFU || !sgFV || !sgFW) continue;
+
+      sgFU->prepareDataAccess(SBG::ACC_READ);
+      sgFV->prepareDataAccess(SBG::ACC_READ);
+      sgFW->prepareDataAccess(SBG::ACC_READ);
+
+      for(int bid = 0; bid < _nBlocks; bid++)
+      {
+        BlockInfo *bi = getBlockInfo(bid, levelMg);
+        if(!bi || bi->level != level) continue;
+        if(!(bi->flags & BLK_EXISTS)) continue;
+
+        CellFlags *f = sgF->getBlockDataPtr(bid);
+        PSFloat   *d = sgD->getBlockDataPtr(bid);
+        if(!f || !d) continue;
+
+        int bx,by,bz;
+        _sg0->getBlockCoordsById(bid, bx, by, bz);
+        const int bsx = sgF->bsx();
+        const int gx0 = bx*bsx, gy0 = by*bsx, gz0 = bz*bsx;
+
+        for(int vz=0, vid=0; vz<bsx; ++vz)
+        for(int vy=0; vy<bsx; ++vy)
+        for(int vx=0; vx<bsx; ++vx, ++vid)
+        {
+          if(f[vid] & (CELL_SOLID | CELL_VOID | CELL_FIXED))
+          { d[vid] = 0; continue; }
+
+          const int gx = gx0+vx, gy = gy0+vy, gz = gz0+vz;
+          const float sum =
+              sgFU->getValueGen_(gx,   gy, gz)
+            + sgFU->getValueGen_(gx+1, gy, gz)
+            + sgFV->getValueGen_(gx, gy,   gz)
+            + sgFV->getValueGen_(gx, gy+1, gz)
+            + sgFW->getValueGen_(gx, gy, gz)
+            + sgFW->getValueGen_(gx, gy, gz+1);
+          d[vid] = (sum > 1e-12f) ? (PSFloat)(1.f / sum) : (PSFloat)0;
+        }
+      }
+    }
+  }
+}
+
+/*-------------------------------------------------------------------------*/
+void MultiresSparseGrid::computeMgDiagRef_( int levelMg )
+{
+  // Find the minimum positive 1/diag among fluid cells at this MG level.
+  // This serves as the reference for density-scaled omega in the smoother.
+  double minPos = 1e30;
+  for(int level = levelMg; level < _nLevels; level++)
+  {
+    auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, levelMg);
+    auto *sgD = getPSFloatChannel(CH_DIAGONAL, level, levelMg);
+    if(!sgF || !sgD) continue;
+    for(int bid = 0; bid < _nBlocks; bid++)
+    {
+      BlockInfo *bi = getBlockInfo(bid, levelMg);
+      if(!bi || bi->level != level || !(bi->flags & BLK_EXISTS)) continue;
+      CellFlags *f = sgF->getBlockDataPtr(bid);
+      PSFloat   *d = sgD->getBlockDataPtr(bid);
+      if(!f || !d) continue;
+      const int n = sgF->nVoxelsInBlock();
+      for(int i = 0; i < n; i++)
+        if(!(f[i] & (CELL_SOLID|CELL_VOID|CELL_FIXED)) && d[i] > 1e-12f)
+          minPos = std::min(minPos, (double)d[i]);
+    }
+  }
+  _mgDiagRef[levelMg] = (minPos < 1e29) ? (float)minPos : (1.f/6.f);
+}
+
+/*-------------------------------------------------------------------------*/
+void MultiresSparseGrid::restrictResidualFLIP_(
+    int levelMgCoarse, int chFineR, int chCoarseRhs )
+{
+  // Density-weighted residual restriction (gamma=0.5):
+  //   r_coarse = sum(sqrt(D_i) * r_i) / sum(sqrt(D_i))
+  // where D_i = 1/A_ii (stored in CH_DIAGONAL).
+  // Liquid cells (small D) get downweighted, preventing air-region
+  // residuals from drowning out liquid-region information.
+
+  const int levelMgFine = levelMgCoarse - 1;
+
+  for(int level = 0; level < _nLevels; level++)
+  {
+    auto *sgDst = getFloatChannel(chCoarseRhs, level, levelMgCoarse);
+    auto *sgSrc = getFloatChannel(chFineR,     level, levelMgFine);
+    auto *sgD   = getPSFloatChannel(CH_DIAGONAL, level, levelMgFine);
+    auto *sgF   = getFlagsChannel(CH_CELL_FLAGS, level, levelMgFine);
+    if(!sgDst || !sgSrc || !sgD || !sgF) continue;
+
+    for(LongInt bidL = 0; bidL < sgDst->nBlocks(); bidL++)
+    {
+      const int bid = (int)bidL;
+      BlockInfo *bi = getBlockInfo(bid, levelMgCoarse);
+      if(!bi || bi->level != level) continue;
+
+      float *dst = sgDst->getBlockDataPtr(bid, 1, 0);
+      if(!dst) continue;
+
+      int bx,by,bz;
+      _sg0->getBlockCoordsById(bid, bx, by, bz);
+      const int bs = sgDst->bsx();
+      const int gx0 = bx*bs, gy0 = by*bs, gz0 = bz*bs;
+
+      for(int vz=0, vid=0; vz<bs; ++vz)
+      for(int vy=0; vy<bs; ++vy)
+      for(int vx=0; vx<bs; ++vx, ++vid)
+      {
+        const int fgx = (gx0+vx)*2, fgy = (gy0+vy)*2, fgz = (gz0+vz)*2;
+        float num = 0.f, den = 0.f;
+        for(int dz=0; dz<2; dz++)
+        for(int dy=0; dy<2; dy++)
+        for(int dx=0; dx<2; dx++)
+        {
+          const int x=fgx+dx, y=fgy+dy, z=fgz+dz;
+          CellFlags cf = sgF->getValueGen_(x,y,z);
+          if(cf & (CELL_SOLID|CELL_VOID|CELL_FIXED)) continue;
+          const float ri = sgSrc->getValueGen_(x,y,z);
+          const float Di = (float)sgD->getValueGen_(x,y,z);
+          const float wi = sqrtf(std::max(Di, 1e-20f));
+          num += wi * ri;
+          den += wi;
+        }
+        dst[vid] = (den > 1e-20f) ? (num / den) : 0.f;
+      }
     }
   }
 }
@@ -2855,6 +3067,41 @@ void MultiresSparseGrid::preparePressureSolveFLIP(
   // 4. Build coarser MG levels by restriction
   for(int lMg = 1; lMg <= coarsest; lMg++)
     restrictPressureMetaFLIP_(lMg);
+
+  // 5. Initialize per-level diagonal reference (used by dense-level smoother)
+  //    and adapt omega globally by sqrt(density ratio) for liquid stability.
+  memset(_mgDiagRef, 0, sizeof(_mgDiagRef));
+  for(int lMg = 0; lMg <= coarsest; lMg++)
+    computeMgDiagRef_(lMg);
+  {
+    float maxInvDiag = 0.f, minInvDiag = 1e30f;
+    for(int level = 0; level < _nLevels; level++) {
+      auto *sgD = getPSFloatChannel(CH_DIAGONAL, level, 0);
+      auto *sgF = getFlagsChannel(CH_CELL_FLAGS, level, 0);
+      if(!sgD || !sgF) continue;
+      for(int bid = 0; bid < _nBlocks; bid++) {
+        BlockInfo *bi = getBlockInfo(bid, 0);
+        if(!bi || bi->level != level || !(bi->flags & BLK_EXISTS)) continue;
+        PSFloat *d = sgD->getBlockDataPtr(bid);
+        CellFlags *f = sgF->getBlockDataPtr(bid);
+        if(!d || !f) continue;
+        for(int i = 0; i < sgD->nVoxelsInBlock(); i++) {
+          if(f[i] & (CELL_SOLID|CELL_VOID|CELL_FIXED)) continue;
+          float v = (float)d[i];
+          if(v > 1e-12f) {
+            if(v > maxInvDiag) maxInvDiag = v;
+            if(v < minInvDiag) minInvDiag = v;
+          }
+        }
+      }
+    }
+    if(maxInvDiag > 1e-12f && minInvDiag > 1e-12f) {
+      float ratio = maxInvDiag / minInvDiag;
+      _mgSmOmega = _mgSmOmegaDefault / sqrtf(std::max(ratio, 1.f));
+      _mgSmOmega = std::max(_mgSmOmega, 0.02f);
+      _mgSmOmega = std::min(_mgSmOmega, _mgSmOmegaDefault);
+    }
+  }
 }
 
 /*-------------------------------------------------------------------------*/
@@ -2928,8 +3175,11 @@ void MultiresSparseGrid::solvePressureFLIPPCG_(
           dq += (double)dd[i]*(double)dq_[i];
       }
     }
-    if(dq <= 1e-30 || rho <= 1e-30) break;
-    const float alpha = (float)((double)rho / (double)dq);
+    if(!(dq > 1e-30) || !(rho > 1e-30) ||
+       !std::isfinite((double)dq) || !std::isfinite((double)rho)) break;
+    const double alphaD = (double)rho / (double)dq;
+    if(!std::isfinite(alphaD)) break;
+    const float alpha = (float)alphaD;
 
     // x += alpha*d, r -= alpha*q
     long double rNormSq = 0;
@@ -2956,7 +3206,7 @@ void MultiresSparseGrid::solvePressureFLIPPCG_(
     if(rNormSq <= tolSq * bNormSq)
     { convergedIter = iter+1; break; }
 
-    // z = M^{-1} r
+    // z = M^{-1} r  (V-cycle preconditioner)
     zeroChannelInPlace(this, chZ, 0);
     vCycle(0, chZ, chR, chQ, chTmp, sp.nPre, sp.nPost, sp.nCoarse);
 
@@ -2974,8 +3224,10 @@ void MultiresSparseGrid::solvePressureFLIPPCG_(
           rhoNew += (double)dr[i]*(double)dz[i];
       }
     }
-    if(rho <= 1e-30) break;
-    const float beta = (float)((double)rhoNew / (double)rho);
+    if(!(rhoNew > 1e-30) || !std::isfinite((double)rhoNew)) break;
+    const double betaD = (double)rhoNew / (double)rho;
+    if(!std::isfinite(betaD)) break;
+    const float beta = (float)betaD;
 
     // d = z + beta*d
     {

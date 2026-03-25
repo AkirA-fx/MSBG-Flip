@@ -3476,6 +3476,8 @@ class MultiresSparseGrid
   void buildRelaxationBlocksFLIP_( int levelMg );
   void allocPressureChannelsFLIP_( int levelMgMax );
   void computeDiagonalFLIP_( int levelMg );
+  void computeMgDiagRef_( int levelMg );
+  void restrictResidualFLIP_( int levelMgCoarse, int chFineR, int chCoarseRhs );
   void solvePressureFLIPPCG_( const FlipPressureSolveParams &params,
                               int *outIters, float *outRelResidual );
 
@@ -3779,6 +3781,7 @@ class MultiresSparseGrid
   	_mgSmOmegaDefault,
   	_mgSmOmegaSched1,
 	_mgSmOmegaSched2;
+  float _mgDiagRef[8];  // per-MG-level reference 1/diag for density-scaled smoother
   int 	_mgSmType,
 	_mgSmIter,
 	_mgSmBlockIter,
