@@ -40,7 +40,7 @@ struct FlipConfig {
     float rhoG              = 1.0f;
     float alphaPhi          = 1.0f;
     float betaMin           = 1e-6f;
-    PressureSolverKind solverKind = PressureSolverKind::MSBG_VCYCLE_PCG;
+    PressureSolverKind solverKind = PressureSolverKind::MIC0_PCG;  // paper baseline
     bool  enableDebugSlice  = true;
 };
 
