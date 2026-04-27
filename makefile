@@ -147,7 +147,7 @@ $(SHARED_LIB): $(OBJS_MSBG_LIB)
 # msbg_demo
 #
 
-OBJS_MSBG_DEMO = main.$(OBJE) msbg_demo.$(OBJE) flip_sim.$(OBJE) vdb_io.$(OBJE) camera_io.$(OBJE)
+OBJS_MSBG_DEMO = main.$(OBJE) msbg_demo.$(OBJE) flip_sim.$(OBJE) vdb_io.$(OBJE) camera_io.$(OBJE) vdb_in.$(OBJE)
 
 LD_LIBS_FOR_MSBG_DEMO = \
 	    -lHYPRE -lmsmpi \
@@ -189,8 +189,40 @@ msbg_demo$(EXE): $(OBJS_MSBG_DEMO) $(STATIC_LIB)
 endif
 
 
+#
+# Python module (Phase 5c)
+#
+PYBIND_INC = -IC:/msys64/mingw64/include/python3.14 \
+             -IC:/msys64/mingw64/lib/python3.14/site-packages/pybind11/include
+PYTHON_EXT_SUFFIX = .cp314-mingw_x86_64_msvcrt_gnu.pyd
+PYTHON_LIB        = -lpython3.14
+PYTHON_MODULE     = msbg_flip$(PYTHON_EXT_SUFFIX)
 
-# 
+OBJS_PYTHON = python_bindings.$(OBJE) flip_sim.$(OBJE) vdb_io.$(OBJE) \
+              camera_io.$(OBJE) vdb_in.$(OBJE)
+
+python_module: $(PYTHON_MODULE)
+
+# python_bindings はヘッダを多く参照するので独自ルールで $(PYBIND_INC) を渡す
+python_bindings.$(OBJE): python_bindings.cpp
+	$(CC) -c $(CPP_FLAGS_ALL) $(PYBIND_INC) \
+	      -o $@ $<
+
+$(PYTHON_MODULE): $(OBJS_PYTHON) $(STATIC_LIB)
+	$(LD) $@ -shared \
+	  -static-libgcc -static-libstdc++ \
+	  $(OBJS_PYTHON) \
+	  -L. -l$(LIBNAME) \
+	  $(LD_LIBS_FOR_MSBG_DEMO) \
+	  $(PYTHON_LIB) \
+	  $(LDFLAGS_BW) \
+	  -lgomp \
+	  -lwinmm \
+	  -Wl,--enable-auto-import \
+	  $(LFLAGS_MT)
+
+
+#
 # clean
 #
 OBJS_ALL = $(OBJS_MIMP) $(OBJS_TSTMKL) $(OBJS_TSTENV) \

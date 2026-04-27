@@ -61,6 +61,11 @@ struct FlipConfig {
     std::string cameraPath  = "";
     int   imageHeight       = 1080;
     float frustumLodScale   = 1.0f;
+
+    // Phase 5b: Houdini -> MSBG collider input
+    std::string colliderPath    = "";
+    float       colliderEps     = 0.5f;   // SDF この値以下で solid 判定
+    float       colliderPushOut = 1.0f;   // 粒子を表面+N voxel 外側に押し出す
 };
 
 //=== FlipParticle ============================================================
@@ -92,6 +97,10 @@ struct FlipGridBundle {
     SBG::SparseGrid<float>*     div      = nullptr;
     SBG::SparseGrid<float>*     pressure = nullptr;
     SBG::SparseGrid<float>*     tmpRelax = nullptr;
+
+    // Phase 5b: collider SDF (dense, sx*sy*sz floats; <0 = inside solid)
+    std::vector<float> colliderSdf;
+    bool hasCollider = false;
 
     void prepareChannels();
     bool rebind();

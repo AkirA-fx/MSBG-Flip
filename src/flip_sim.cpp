@@ -17,6 +17,7 @@
 #include "flip_sim.h"
 #include "vdb_io.h"
 #include "camera_io.h"
+#include "vdb_in.h"
 
 // hypre (AMG preconditioner)
 #include "HYPRE.h"
@@ -869,6 +870,29 @@ void FlipSimulation::particleToGrid()
         }
         if(hasFluid) state_.activeBlocks.push_back(bid);
     }
+
+    // Phase 5b: collider セル内の mass/velocity をゼロ化
+    // pressure ソルバーで非流体扱い、isFluid() が false を返す
+    if(grid_.hasCollider)
+    {
+        const int sxd = grid_.sx, syd = grid_.sy, szd = grid_.sz;
+        const float colliderEps = cfg_.colliderEps;
+        const std::vector<float>& sdf = grid_.colliderSdf;
+        tbb::parallel_for(0, szd, [&](int iz) {
+            for(int iy=0; iy<syd; iy++)
+                for(int ix=0; ix<sxd; ix++) {
+                    const float sd = sdf[size_t(ix)
+                                        + size_t(iy)*size_t(sxd)
+                                        + size_t(iz)*size_t(sxd)*size_t(syd)];
+                    if(sd < colliderEps) {
+                        setF(sgMass, ix, iy, iz, 0.f);
+                        setVC(sgVel,  ix, iy, iz, 0, 0.f);
+                        setVC(sgVel,  ix, iy, iz, 1, 0.f);
+                        setVC(sgVel,  ix, iy, iz, 2, 0.f);
+                    }
+                }
+        });
+    }
 }
 
 //=== FlipSimulation: gravity =================================================
@@ -1638,6 +1662,43 @@ void FlipSimulation::advectParticles(float dt)
             p.pos.y += dt*k2.y;
             p.pos.z += dt*k2.z;
 
+            // Phase 5b: collider 内に入ったら SDF 法線方向に押し出し + slip BC
+            if(grid_.hasCollider) {
+                int ix = std::clamp((int)floorf(p.pos.x), 0, sx-1);
+                int iy = std::clamp((int)floorf(p.pos.y), 0, sy-1);
+                int iz = std::clamp((int)floorf(p.pos.z), 0, sz-1);
+                const std::vector<float>& sdf = grid_.colliderSdf;
+                auto sdAt = [&](int x,int y,int z) -> float {
+                    x = std::clamp(x, 0, sx-1);
+                    y = std::clamp(y, 0, sy-1);
+                    z = std::clamp(z, 0, sz-1);
+                    return sdf[size_t(x) + size_t(y)*size_t(sx)
+                                         + size_t(z)*size_t(sx)*size_t(sy)];
+                };
+                const float sd = sdAt(ix,iy,iz);
+                if(sd < 0.f) {
+                    // 中心差分で勾配 = SDF 法線
+                    const float gx = sdAt(ix+1,iy,iz) - sdAt(ix-1,iy,iz);
+                    const float gy = sdAt(ix,iy+1,iz) - sdAt(ix,iy-1,iz);
+                    const float gz = sdAt(ix,iy,iz+1) - sdAt(ix,iy,iz-1);
+                    const float L = sqrtf(gx*gx + gy*gy + gz*gz);
+                    if(L > 1e-6f) {
+                        const float nx = gx/L, ny = gy/L, nz = gz/L;
+                        const float push = -sd + cfg_.colliderPushOut;
+                        p.pos.x += push * nx;
+                        p.pos.y += push * ny;
+                        p.pos.z += push * nz;
+                        // 法線方向の侵入速度成分をゼロ化 (slip BC)
+                        const float vn = p.vel.x*nx + p.vel.y*ny + p.vel.z*nz;
+                        if(vn < 0.f) {
+                            p.vel.x -= vn * nx;
+                            p.vel.y -= vn * ny;
+                            p.vel.z -= vn * nz;
+                        }
+                    }
+                }
+            }
+
             // Boundary clamp + free-slip BC
             if(p.pos.x<0.f) {p.pos.x=0.f;  p.vel.x=std::max(p.vel.x,0.f);}
             if(p.pos.x>xMax){p.pos.x=xMax; p.vel.x=std::min(p.vel.x,0.f);}
@@ -1669,6 +1730,26 @@ int FlipSimulation::runDamBreak(int nSteps)
 
     // 粒子初期化
     initializeParticles();
+
+    // Phase 5b: collider SDF VDB を読み込み (静的、起動時 1 回のみ)
+    if(!cfg_.colliderPath.empty())
+    {
+        bool ok = VdbIn::readColliderSDF(
+            cfg_.colliderPath, sx, sy, sz, grid_.colliderSdf);
+        if(ok)
+        {
+            grid_.hasCollider = true;
+            int nSolid = 0;
+            for(float v : grid_.colliderSdf) if(v < cfg_.colliderEps) nSolid++;
+            TRCP(("Loaded collider SDF: %s (%dx%dx%d, %d solid cells)\n",
+                  cfg_.colliderPath.c_str(), sx, sy, sz, nSolid));
+        }
+        else
+        {
+            TRCERR(("Failed to load collider: %s (continuing without)\n",
+                    cfg_.colliderPath.c_str()));
+        }
+    }
 
     // §3.4 Step C: カメラパス読込 (frustum-aware refinement 用)
     if(cfg_.useFrustumRefinement && !cfg_.cameraPath.empty())

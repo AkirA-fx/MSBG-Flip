@@ -47,6 +47,7 @@ static void showUsage( void )
   printf("  -o<dir>  Output directory for Phase 5a VDB frames\n");
   printf("  -s<n>    Frame output stride (1=every frame, default=1)\n");
   printf("  -k<path> Camera path (TSV) for frustum-aware refinement\n");
+  printf("  -C<path> Collider SDF VDB (static, loaded once at startup)\n");
   printf("  -h show this help\n");  
   printf("\n");
 }
@@ -88,6 +89,7 @@ int main(int argc, char **argv)
   std::string outputDir;
   int outputStride = 1;
   std::string cameraPath;
+  std::string colliderPath;
 
   extern float camPos[3];
   extern float camLookAt[3];
@@ -97,7 +99,7 @@ int main(int argc, char **argv)
 
   {
     char c;
-    while((c = getopt(argc,argv,"hl:i:a:b:u:r:f:c:jv:o:s:k:")) != EOF)
+    while((c = getopt(argc,argv,"hl:i:a:b:u:r:f:c:jv:o:s:k:C:")) != EOF)
     {
       switch(c)
       {
@@ -159,6 +161,9 @@ int main(int argc, char **argv)
 	  break;
 	case 'k':
 	  cameraPath = optarg;
+	  break;
+	case 'C':
+	  colliderPath = optarg;
 	  break;
 	case 'b':
 	  blockSize0 = atoi( optarg );
@@ -246,6 +251,9 @@ int main(int argc, char **argv)
     if(!cameraPath.empty()) {
         cfg.cameraPath = cameraPath;
         cfg.useFrustumRefinement = true;
+    }
+    if(!colliderPath.empty()) {
+        cfg.colliderPath = colliderPath;
     }
     return FlipSimulation::runStandaloneDamBreak(
         resolution, blockSize0, /*nSteps=*/20, cfg);
