@@ -147,13 +147,14 @@ $(SHARED_LIB): $(OBJS_MSBG_LIB)
 # msbg_demo
 #
 
-OBJS_MSBG_DEMO = main.$(OBJE) msbg_demo.$(OBJE) flip_sim.$(OBJE)
+OBJS_MSBG_DEMO = main.$(OBJE) msbg_demo.$(OBJE) flip_sim.$(OBJE) vdb_io.$(OBJE) camera_io.$(OBJE)
 
 LD_LIBS_FOR_MSBG_DEMO = \
 	    -lHYPRE -lmsmpi \
+	    -lopenvdb -lboost_iostreams-mt -lblosc \
 	    -lpng \
 	    -ljpeg \
-	    -ltbbmalloc -ltbb -ltbbmalloc_proxy \
+	    -ltbbmalloc -ltbb12 -ltbbmalloc_proxy \
 	    -lz \
 	    -lm
 

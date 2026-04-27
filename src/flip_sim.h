@@ -20,7 +20,9 @@
 
 #include <vector>
 #include <memory>
+#include <string>
 #include "msbg.h"
+#include "camera_io.h"
 
 //=== Solver selection ========================================================
 enum class PressureSolverKind { MIC0_PCG, HYPRE_AMG_PCG, MSBG_VCYCLE_PCG };
@@ -42,6 +44,23 @@ struct FlipConfig {
     float betaMin           = 1e-6f;
     PressureSolverKind solverKind = PressureSolverKind::MIC0_PCG;  // paper baseline
     bool  enableDebugSlice  = true;
+
+    // Phase 5a: VDB / BGEO output
+    std::string outputDir = "";
+    bool  outputDensity     = true;
+    bool  outputVelocity    = true;
+    bool  outputPressure    = false;
+    bool  outputSurface     = true;
+    bool  outputParticles   = false;
+    bool  useFloat16        = true;
+    float narrowBandPhi     = 0.5f;
+    float narrowBandWidth   = 3.0f;
+    int   outputStride      = 1;
+    bool  outputVelocityForBlend = true;
+    bool  useFrustumRefinement = false;
+    std::string cameraPath  = "";
+    int   imageHeight       = 1080;
+    float frustumLodScale   = 1.0f;
 };
 
 //=== FlipParticle ============================================================
@@ -52,6 +71,7 @@ struct FlipState {
     std::vector<FlipParticle> particles;
     std::vector<int> activeBlocks;
     std::vector<int> refinementMap;
+    std::vector<CameraIO::CameraFrame> cameraPath;
     int   step = 0;
     float time = 0.0f;
 };
@@ -108,6 +128,7 @@ public:
 
     int runDamBreak(int nSteps);
     static int runStandaloneDamBreak(int resolution, int blockSize, int nSteps);
+    static int runStandaloneDamBreak(int resolution, int blockSize, int nSteps, FlipConfig cfg);
 
     const FlipConfig&    config() const { return cfg_; }
     const FlipState&     state()  const { return state_; }

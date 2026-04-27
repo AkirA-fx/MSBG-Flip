@@ -15,6 +15,8 @@
 #include "msbg.h"
 #include "bitmap.h"
 #include "flip_sim.h"
+#include "vdb_io.h"
+#include "camera_io.h"
 
 // hypre (AMG preconditioner)
 #include "HYPRE.h"
@@ -534,6 +536,48 @@ bool FlipSimulation::updateRefinementMap()
         else if(nLevels>=2 && d==2) newMap[bid]=1;
         else newMap[bid]=coarsest;
     }
+
+    // §3.4 拡張: カメラ frustum / pixel-size LOD で更に粗くする
+    // ルール: level_final = max(level_from_liquid, level_from_camera)
+    //   - 視錐台外 → 強制 coarsest
+    //   - 視錐台内 → block 中心の画面 px サイズで粗さを決定
+    //   - ただし液体ブロック (dist[bid]==0) は論文路線として L0 維持
+    if(cfg_.useFrustumRefinement && !state_.cameraPath.empty())
+    {
+        const int frameForLookup = state_.step + 1;
+        const CameraIO::CameraFrame *cam =
+            CameraIO::findCameraForFrame(state_.cameraPath, frameForLookup);
+        if(cam)
+        {
+            const int bsx = sg0->bsx();
+            const float blockSizeWorld = (float)bsx;
+            int nFrustumOut=0, nPixelLod=0;
+            for(int bid=0; bid<nBlk; bid++)
+            {
+                if(dist[bid] == 0) continue;  // liquid: keep L0
+                int bx, by, bz;
+                sg0->getBlockCoordsById(bid, bx, by, bz);
+                const float bp[3] = {
+                    (bx + 0.5f) * blockSizeWorld,
+                    (by + 0.5f) * blockSizeWorld,
+                    (bz + 0.5f) * blockSizeWorld
+                };
+                int camLevel;
+                if(!CameraIO::inFrustum(*cam, bp))
+                { camLevel = coarsest; nFrustumOut++; }
+                else
+                {
+                    camLevel = CameraIO::levelFromPixelSize(
+                        *cam, bp, blockSizeWorld,
+                        cfg_.imageHeight, cfg_.frustumLodScale, coarsest);
+                    if(camLevel > newMap[bid]) nPixelLod++;
+                }
+                newMap[bid] = std::max(newMap[bid], camLevel);
+            }
+            TRCP(("  frustum: out=%d pxLod=%d\n", nFrustumOut, nPixelLod));
+        }
+    }
+
     msbg->regularizeRefinementMap(newMap.data());
 
     int cnt[3]={0,0,0};
@@ -1626,6 +1670,23 @@ int FlipSimulation::runDamBreak(int nSteps)
     // 粒子初期化
     initializeParticles();
 
+    // §3.4 Step C: カメラパス読込 (frustum-aware refinement 用)
+    if(cfg_.useFrustumRefinement && !cfg_.cameraPath.empty())
+    {
+        size_t n = CameraIO::readCameraPath(cfg_.cameraPath, state_.cameraPath);
+        if(n == 0)
+        {
+            TRCERR(("Failed to read camera path: %s (frustum disabled)\n",
+                    cfg_.cameraPath.c_str()));
+            cfg_.useFrustumRefinement = false;
+        }
+        else
+        {
+            TRCP(("Loaded %zu camera frames from %s\n",
+                  n, cfg_.cameraPath.c_str()));
+        }
+    }
+
     // §3.4: 初回 refinement map 構築
     updateRefinementMap();
     msbg->setRefinementMap(state_.refinementMap.data(),NULL,-1,NULL,false,true);
@@ -1683,6 +1744,8 @@ int FlipSimulation::runDamBreak(int nSteps)
 
         if(cfg_.enableDebugSlice)
             FlipDebugOutput::saveParticleSlice(state_,step,sx,sy,sz);
+        if(!cfg_.outputDir.empty())
+            VdbIO::writeFrame(state_, grid_, cfg_, step+1);
     }
 
     TRCP(("=== Done ===\n"));
@@ -1690,6 +1753,12 @@ int FlipSimulation::runDamBreak(int nSteps)
 }
 
 int FlipSimulation::runStandaloneDamBreak(int resolution, int blockSize, int nSteps)
+{
+    return runStandaloneDamBreak(resolution, blockSize, nSteps, FlipConfig{});
+}
+
+int FlipSimulation::runStandaloneDamBreak(int resolution, int blockSize, int nSteps,
+                                          FlipConfig cfg)
 {
     using namespace MSBG;
     const int sx = ALIGN(resolution, blockSize), sy=sx, sz=sx;
@@ -1700,7 +1769,7 @@ int FlipSimulation::runStandaloneDamBreak(int resolution, int blockSize, int nSt
     );
     if(!msbg){TRCERR(("create() failed\n"));return 1;}
 
-    FlipSimulation sim(*msbg);
+    FlipSimulation sim(*msbg, cfg);
     int rc = sim.runDamBreak(nSteps);
 
     MultiresSparseGrid::destroy(msbg);
