@@ -912,6 +912,41 @@ void FlipSimulation::applyGravity(float dt)
         const bool fHi=(iy<ny)&&isFluid(sgMass,ix,iy,  iz,MASS_EPS);
         if(fLo||fHi) setVC(sgVel,ix,iy,iz,1,getVC(sgVel,ix,iy,iz,1)+cfg_.gravity*dt);
     }
+
+    // Phase 5c-ext: 外力 field (cell-centered acceleration -> MAC face で平均)
+    if(grid_.hasExternalForce && grid_.externalForce.size() == size_t(nx)*ny*nz*3)
+    {
+        const std::vector<float>& f = grid_.externalForce;
+        auto fAt = [&](int x,int y,int z,int c) -> float {
+            if(x<0||x>=nx||y<0||y>=ny||z<0||z>=nz) return 0.f;
+            return f[(size_t(x) + size_t(y)*nx + size_t(z)*size_t(nx)*ny) * 3 + c];
+        };
+        // u 面
+        for(int iz=0;iz<nz;iz++) for(int iy=0;iy<ny;iy++) for(int ix=0;ix<=nx;ix++) {
+            const bool fL=(ix>0 )&&isFluid(sgMass,ix-1,iy,iz,MASS_EPS);
+            const bool fR=(ix<nx)&&isFluid(sgMass,ix,  iy,iz,MASS_EPS);
+            if(!(fL||fR)) continue;
+            const float ax = 0.5f*(fAt(ix-1,iy,iz,0)+fAt(ix,iy,iz,0));
+            setVC(sgVel,ix,iy,iz,0,getVC(sgVel,ix,iy,iz,0)+ax*dt);
+        }
+        // v 面
+        for(int iz=0;iz<nz;iz++) for(int iy=0;iy<=ny;iy++) for(int ix=0;ix<nx;ix++) {
+            const bool fLo=(iy>0 )&&isFluid(sgMass,ix,iy-1,iz,MASS_EPS);
+            const bool fHi=(iy<ny)&&isFluid(sgMass,ix,iy,  iz,MASS_EPS);
+            if(!(fLo||fHi)) continue;
+            const float ay = 0.5f*(fAt(ix,iy-1,iz,1)+fAt(ix,iy,iz,1));
+            setVC(sgVel,ix,iy,iz,1,getVC(sgVel,ix,iy,iz,1)+ay*dt);
+        }
+        // w 面
+        for(int iz=0;iz<=nz;iz++) for(int iy=0;iy<ny;iy++) for(int ix=0;ix<nx;ix++) {
+            const bool fN=(iz>0 )&&isFluid(sgMass,ix,iy,iz-1,MASS_EPS);
+            const bool fF=(iz<nz)&&isFluid(sgMass,ix,iy,iz,  MASS_EPS);
+            if(!(fN||fF)) continue;
+            const float az = 0.5f*(fAt(ix,iy,iz-1,2)+fAt(ix,iy,iz,2));
+            setVC(sgVel,ix,iy,iz,2,getVC(sgVel,ix,iy,iz,2)+az*dt);
+        }
+    }
+
     // solid BC
     for(int iy=0;iy<ny;iy++) for(int iz=0;iz<nz;iz++)
     { setVC(sgVel,0,iy,iz,0,0.f); setVC(sgVel,nx-1,iy,iz,0,0.f); }
@@ -1710,18 +1745,13 @@ void FlipSimulation::advectParticles(float dt)
     });
 }
 
-//=== FlipSimulation: run =====================================================
+//=== FlipSimulation: initialize / stepOnce ===================================
 
-int FlipSimulation::runDamBreak(int nSteps)
+bool FlipSimulation::initialize()
 {
     using namespace MSBG;
     auto *msbg = grid_.msbg;
     const int sx=grid_.sx, sy=grid_.sy, sz=grid_.sz;
-
-    TRCP(("=== FLIP Dam Break (PF-FLIP, 2-phase) ===\n"));
-    TRCP(("resolution=%d blockSize=%d nSteps=%d dt_max=%.4f CFL=%.1f\n",
-          sx,(int)msbg->sg0()->bsx(),nSteps,cfg_.dtMax,cfg_.cflNumber));
-    TRCP(("RHO_L=%.0f RHO_G=%.1f ratio=%.0f:1\n",cfg_.rhoL,cfg_.rhoG,cfg_.rhoL/cfg_.rhoG));
 
     msbg->setDomainBoundarySpec_(DBC_SOLID,DBC_SOLID,DBC_SOLID,DBC_OPEN,DBC_SOLID,DBC_SOLID);
 
@@ -1731,8 +1761,9 @@ int FlipSimulation::runDamBreak(int nSteps)
     // 粒子初期化
     initializeParticles();
 
-    // Phase 5b: collider SDF VDB を読み込み (静的、起動時 1 回のみ)
-    if(!cfg_.colliderPath.empty())
+    // Phase 5b: collider SDF VDB をファイルから読み込み (静的、起動時 1 回のみ)
+    // Python から set_collider() で in-memory 設定する場合はこのパスを通らない。
+    if(!cfg_.colliderPath.empty() && !grid_.hasCollider)
     {
         bool ok = VdbIn::readColliderSDF(
             cfg_.colliderPath, sx, sy, sz, grid_.colliderSdf);
@@ -1774,59 +1805,104 @@ int FlipSimulation::runDamBreak(int nSteps)
     grid_.prepareChannels();
 
     if(!grid_.rebind())
-    { TRCERR(("Null channel pointer!\n")); return 1; }
+    { TRCERR(("Null channel pointer!\n")); return false; }
     grid_.touchAllBlocks();
 
     TRCP(("Grid: %dx%dx%d blocks=%d blockSize=%d\n",
           sx,sy,sz,(int)grid_.vel->nBlocks(),(int)msbg->sg0()->bsx()));
 
+    state_.step = 0;
+    state_.time = 0.0f;
+    return true;
+}
+
+bool FlipSimulation::stepOnce()
+{
+    using namespace MSBG;
+    auto *msbg = grid_.msbg;
+    const int sx=grid_.sx, sy=grid_.sy, sz=grid_.sz;
+
     UtTimer tm, tm2;
-    for(int step=0;step<nSteps;step++)
+    TIMER_START(&tm);
+
+    // §3.4: refinement map を毎step更新
+    if(updateRefinementMap())
     {
-        TIMER_START(&tm);
+        msbg->setRefinementMap(state_.refinementMap.data(),NULL,-1,NULL,false,true);
+        grid_.prepareChannels();
+        if(!grid_.rebind())
+        { TRCERR(("Null channel after regrid\n")); return false; }
+        grid_.touchAllBlocks();
+    }
 
-        // §3.4: refinement map を毎step更新
-        if(updateRefinementMap())
-        {
-            msbg->setRefinementMap(state_.refinementMap.data(),NULL,-1,NULL,false,true);
-            grid_.prepareChannels();
-            if(!grid_.rebind())
-            { TRCERR(("Null channel after regrid\n")); break; }
-            grid_.touchAllBlocks();
-        }
+    const float dt = computeDt();
 
-        const float dt = computeDt();
+    TIMER_START(&tm2);
+    particleToGrid();
+    TIMER_STOP(&tm2); double t_p2g=TIMER_DIFF_MS(&tm2);
+    TIMER_START(&tm2);
+    applyGravity(dt);
+    TIMER_STOP(&tm2); double t_grav=TIMER_DIFF_MS(&tm2);
+    TIMER_START(&tm2);
+    pressureProjection(dt);
+    TIMER_STOP(&tm2); double t_press=TIMER_DIFF_MS(&tm2);
+    TIMER_START(&tm2);
+    gridToParticle();
+    TIMER_STOP(&tm2); double t_g2p=TIMER_DIFF_MS(&tm2);
+    TIMER_START(&tm2);
+    advectParticles(dt);
+    TIMER_STOP(&tm2); double t_adv=TIMER_DIFF_MS(&tm2);
+    TIMER_STOP(&tm);
 
-        TIMER_START(&tm2);
-        particleToGrid();
-        TIMER_STOP(&tm2); double t_p2g=TIMER_DIFF_MS(&tm2);
-        TIMER_START(&tm2);
-        applyGravity(dt);
-        TIMER_STOP(&tm2); double t_grav=TIMER_DIFF_MS(&tm2);
-        TIMER_START(&tm2);
-        pressureProjection(dt);
-        TIMER_STOP(&tm2); double t_press=TIMER_DIFF_MS(&tm2);
-        TIMER_START(&tm2);
-        gridToParticle();
-        TIMER_STOP(&tm2); double t_g2p=TIMER_DIFF_MS(&tm2);
-        TIMER_START(&tm2);
-        advectParticles(dt);
-        TIMER_STOP(&tm2); double t_adv=TIMER_DIFF_MS(&tm2);
-        TIMER_STOP(&tm);
+    const int frame = state_.step + 1;
+    state_.step = frame;
+    state_.time += dt;
 
-        state_.step = step + 1;
-        state_.time += dt;
+    TRCP(("step %3d  particles=%d  activeBlocks=%d  %.3f sec  dt=%.4f\n",
+          frame,(int)state_.particles.size(),(int)state_.activeBlocks.size(),
+          (double)TIMER_DIFF_MS(&tm)/1000.0, dt));
+    TRCP(("  P2G=%.1f Grav=%.1f Press=%.1f G2P=%.1f Adv=%.1f ms\n",
+          t_p2g,t_grav,t_press,t_g2p,t_adv));
 
-        TRCP(("step %3d/%d  particles=%d  activeBlocks=%d  %.3f sec  dt=%.4f\n",
-              step+1,nSteps,(int)state_.particles.size(),(int)state_.activeBlocks.size(),
-              (double)TIMER_DIFF_MS(&tm)/1000.0, dt));
-        TRCP(("  P2G=%.1f Grav=%.1f Press=%.1f G2P=%.1f Adv=%.1f ms\n",
-              t_p2g,t_grav,t_press,t_g2p,t_adv));
+    if(cfg_.enableDebugSlice)
+        FlipDebugOutput::saveParticleSlice(state_,frame-1,sx,sy,sz);
+    if(!cfg_.outputDir.empty())
+        VdbIO::writeFrame(state_, grid_, cfg_, frame);
+    return true;
+}
 
-        if(cfg_.enableDebugSlice)
-            FlipDebugOutput::saveParticleSlice(state_,step,sx,sy,sz);
-        if(!cfg_.outputDir.empty())
-            VdbIO::writeFrame(state_, grid_, cfg_, step+1);
+void FlipSimulation::addParticles(
+    const std::vector<Vec3Float>& pos,
+    const std::vector<Vec3Float>& vel,
+    const std::vector<int>& phase)
+{
+    if(pos.size() != vel.size() || pos.size() != phase.size())
+        return;  // silently ignore mismatched arrays
+    state_.particles.reserve(state_.particles.size() + pos.size());
+    for(size_t i=0; i<pos.size(); i++) {
+        FlipParticle p;
+        p.pos = pos[i];
+        p.vel = vel[i];
+        p.phase = phase[i];
+        state_.particles.push_back(p);
+    }
+}
+
+//=== FlipSimulation: run =====================================================
+
+int FlipSimulation::runDamBreak(int nSteps)
+{
+    auto *msbg = grid_.msbg;
+    const int sx=grid_.sx;
+
+    TRCP(("=== FLIP Dam Break (PF-FLIP, 2-phase) ===\n"));
+    TRCP(("resolution=%d blockSize=%d nSteps=%d dt_max=%.4f CFL=%.1f\n",
+          sx,(int)msbg->sg0()->bsx(),nSteps,cfg_.dtMax,cfg_.cflNumber));
+    TRCP(("RHO_L=%.0f RHO_G=%.1f ratio=%.0f:1\n",cfg_.rhoL,cfg_.rhoG,cfg_.rhoL/cfg_.rhoG));
+
+    if(!initialize()) return 1;
+    for(int i=0; i<nSteps; i++) {
+        if(!stepOnce()) return 1;
     }
 
     TRCP(("=== Done ===\n"));

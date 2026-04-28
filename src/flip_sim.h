@@ -102,6 +102,13 @@ struct FlipGridBundle {
     std::vector<float> colliderSdf;
     bool hasCollider = false;
 
+    // Phase 5c-ext: external force field
+    //   Layout: (ix + iy*sx + iz*sx*sy)*3 + {0,1,2} for {fx, fy, fz}
+    //   Value: per-cell acceleration in voxel/sec^2
+    //   Persists until cleared or replaced.
+    std::vector<float> externalForce;
+    bool hasExternalForce = false;
+
     void prepareChannels();
     bool rebind();
     void touchAllBlocks();
@@ -139,10 +146,19 @@ public:
     static int runStandaloneDamBreak(int resolution, int blockSize, int nSteps);
     static int runStandaloneDamBreak(int resolution, int blockSize, int nSteps, FlipConfig cfg);
 
+    // Phase 5c-ext: step-by-step driving (Python / interactive use)
+    bool initialize();
+    bool stepOnce();
+    void addParticles(const std::vector<Vec3Float>& pos,
+                      const std::vector<Vec3Float>& vel,
+                      const std::vector<int>& phase);
+
     const FlipConfig&    config() const { return cfg_; }
+    FlipConfig&          config()       { return cfg_; }
     const FlipState&     state()  const { return state_; }
     FlipState&           state()        { return state_; }
     const FlipGridBundle& grid()  const { return grid_; }
+    FlipGridBundle&      grid()         { return grid_; }
 
 private:
     FlipConfig                  cfg_;

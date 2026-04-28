@@ -74,7 +74,7 @@ public:
     // pybind11 では Python 側で sim.configure(rho_l=..., ...) と呼ぶ。
     void configure(py::kwargs kwargs)
     {
-        FlipConfig& cfg = const_cast<FlipConfig&>(sim_->config());
+        FlipConfig& cfg = sim_->config();
         for(auto item : kwargs) {
             std::string key = py::str(item.first);
             const py::handle& val = item.second;
@@ -119,7 +119,7 @@ public:
             throw py::value_error("collider sdf shape must match (sx, sy, sz)");
 
         // FlipGridBundle.colliderSdf に flat 転送 (layout: ix + iy*sx + iz*sx*sy)
-        FlipGridBundle& gb = const_cast<FlipGridBundle&>(sim_->grid());
+        FlipGridBundle& gb = sim_->grid();
         gb.colliderSdf.assign(size_t(sx_) * sy_ * sz_, 0.f);
         auto buf = sdf.unchecked<3>();
         for(int iz=0; iz<sz_; iz++)
@@ -132,13 +132,79 @@ public:
                 }
         gb.hasCollider = true;
 
-        FlipConfig& cfg = const_cast<FlipConfig&>(sim_->config());
+        FlipConfig& cfg = sim_->config();
         cfg.colliderEps = eps;
         cfg.colliderPushOut = push_out;
     }
 
-    // dam-break シーンを n ステップ走らせる。
-    // 内部的には既存の runDamBreak(n) を呼ぶ。
+    // numpy ndarray (sx, sy, sz, 3) float32 を外力 field として登録
+    void set_external_force(
+        py::array_t<float, py::array::c_style | py::array::forcecast> field)
+    {
+        if(field.ndim() != 4)
+            throw py::value_error("external force must be 4-dimensional");
+        if(field.shape(0) != sx_ || field.shape(1) != sy_ ||
+           field.shape(2) != sz_ || field.shape(3) != 3)
+            throw py::value_error("external force shape must be (sx, sy, sz, 3)");
+
+        FlipGridBundle& gb = sim_->grid();
+        gb.externalForce.assign(size_t(sx_) * sy_ * sz_ * 3, 0.f);
+        auto buf = field.unchecked<4>();
+        for(int iz=0; iz<sz_; iz++)
+            for(int iy=0; iy<sy_; iy++)
+                for(int ix=0; ix<sx_; ix++) {
+                    const size_t base = (size_t(ix)
+                                       + size_t(iy)*size_t(sx_)
+                                       + size_t(iz)*size_t(sx_)*size_t(sy_)) * 3;
+                    gb.externalForce[base + 0] = buf(ix, iy, iz, 0);
+                    gb.externalForce[base + 1] = buf(ix, iy, iz, 1);
+                    gb.externalForce[base + 2] = buf(ix, iy, iz, 2);
+                }
+        gb.hasExternalForce = true;
+    }
+
+    void clear_external_force()
+    {
+        FlipGridBundle& gb = sim_->grid();
+        gb.externalForce.clear();
+        gb.hasExternalForce = false;
+    }
+
+    // numpy (N,3) pos, (N,3) vel, (N,) phase を粒子配列に追加
+    void add_particles(
+        py::array_t<float, py::array::c_style | py::array::forcecast> pos,
+        py::array_t<float, py::array::c_style | py::array::forcecast> vel,
+        py::array_t<int,   py::array::c_style | py::array::forcecast> phase)
+    {
+        if(pos.ndim() != 2 || pos.shape(1) != 3)
+            throw py::value_error("pos must have shape (N, 3)");
+        if(vel.ndim() != 2 || vel.shape(1) != 3)
+            throw py::value_error("vel must have shape (N, 3)");
+        if(phase.ndim() != 1)
+            throw py::value_error("phase must have shape (N,)");
+        const py::ssize_t N = pos.shape(0);
+        if(vel.shape(0) != N || phase.shape(0) != N)
+            throw py::value_error("pos / vel / phase must agree on N");
+
+        std::vector<Vec3Float> pv(N), vv(N);
+        std::vector<int> ph(N);
+        auto pbuf = pos.unchecked<2>();
+        auto vbuf = vel.unchecked<2>();
+        auto phbuf = phase.unchecked<1>();
+        for(py::ssize_t i=0; i<N; i++) {
+            pv[i] = Vec3Float(pbuf(i,0), pbuf(i,1), pbuf(i,2));
+            vv[i] = Vec3Float(vbuf(i,0), vbuf(i,1), vbuf(i,2));
+            ph[i] = phbuf(i);
+        }
+        sim_->addParticles(pv, vv, ph);
+    }
+
+    // step-by-step driving
+    bool initialize() { return sim_->initialize(); }
+    bool step()       { return sim_->stepOnce(); }
+    int  step_number() const { return sim_->state().step; }
+
+    // dam-break シーンを n ステップ走らせる。内部的に runDamBreak を呼ぶ。
     int run(int nSteps)
     {
         if(nSteps < 0) throw std::invalid_argument("nSteps must be >= 0");
@@ -260,10 +326,28 @@ PYBIND11_MODULE(msbg_flip, m) {
              "Update FlipConfig fields (rho_l, rho_g, cfl, solver, ...).")
         .def("set_collider", &PyFlipSim::set_collider,
              py::arg("sdf"), py::arg("eps") = 0.5f, py::arg("push_out") = 1.0f,
-             "Register a (sx,sy,sz) float32 SDF as a static collider. <0 = inside.")
+             "Register a (sx,sy,sz) float32 SDF as a collider. May be called "
+             "every step to drive an animated collider; <0 = inside.")
+        .def("set_external_force", &PyFlipSim::set_external_force,
+             py::arg("field"),
+             "Register a (sx,sy,sz,3) float32 acceleration field. Persists "
+             "until cleared or replaced.")
+        .def("clear_external_force", &PyFlipSim::clear_external_force,
+             "Disable the external force field.")
+        .def("add_particles", &PyFlipSim::add_particles,
+             py::arg("pos"), py::arg("vel"), py::arg("phase"),
+             "Append particles. pos/vel: (N,3) float32; phase: (N,) int32.")
+        .def("initialize", &PyFlipSim::initialize,
+             "Run scene setup (particle init, collider, refinement, channel "
+             "binding). Required before step().")
+        .def("step", &PyFlipSim::step,
+             "Advance one timestep. Call after initialize().")
+        .def_property_readonly("step_number", &PyFlipSim::step_number,
+             "Current step counter (incremented by step()/run()).")
         .def("run", &PyFlipSim::run,
              py::arg("n_steps"),
-             "Run the dam-break simulation for n_steps timesteps.")
+             "Run the dam-break simulation for n_steps timesteps "
+             "(initialize + n*step internally).")
         .def("get_density", &PyFlipSim::get_density,
              "Return cell mass grid as ndarray (sx, sy, sz) float32.")
         .def("get_velocity", &PyFlipSim::get_velocity,
